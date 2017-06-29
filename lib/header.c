@@ -20,7 +20,9 @@
  */
 
 #include "private-libwebsockets.h"
+
 #include "lextable-strings.h"
+
 
 const unsigned char *lws_token_to_string(enum lws_token_indexes token)
 {
@@ -94,13 +96,13 @@ lws_add_http_header_by_token(struct lws *wsi, enum lws_token_indexes token,
 }
 
 int lws_add_http_header_content_length(struct lws *wsi,
-				       unsigned long content_length,
+				       lws_filepos_t content_length,
 				       unsigned char **p, unsigned char *end)
 {
 	char b[24];
 	int n;
 
-	n = sprintf(b, "%lu", content_length);
+	n = sprintf(b, "%llu", (unsigned long long)content_length);
 	if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_LENGTH,
 					 (unsigned char *)b, n, p, end))
 		return 1;
@@ -110,7 +112,7 @@ int lws_add_http_header_content_length(struct lws *wsi,
 	return 0;
 }
 
-static const char *err400[] = {
+STORE_IN_ROM static const char * const err400[] = {
 	"Bad Request",
 	"Unauthorized",
 	"Payment Required",
@@ -131,7 +133,7 @@ static const char *err400[] = {
 	"Expectation Failed"
 };
 
-static const char *err500[] = {
+STORE_IN_ROM static const char * const err500[] = {
 	"Internal Server Error",
 	"Not Implemented",
 	"Bad Gateway",
@@ -141,12 +143,21 @@ static const char *err500[] = {
 };
 
 int
-lws_add_http_header_status(struct lws *wsi, unsigned int code,
+lws_add_http_header_status(struct lws *wsi, unsigned int _code,
 			   unsigned char **p, unsigned char *end)
 {
+	STORE_IN_ROM static const char * const hver[] = {
+		"HTTP/1.0", "HTTP/1.1", "HTTP/2"
+	};
+	const struct lws_protocol_vhost_options *headers;
+	unsigned int code = _code & LWSAHH_CODE_MASK;
+	const char *description = "", *p1;
 	unsigned char code_and_desc[60];
-	const char *description = "";
 	int n;
+
+#ifdef LWS_WITH_ACCESS_LOG
+	wsi->access_log.response = code;
+#endif
 
 #ifdef LWS_USE_HTTP2
 	if (wsi->mode == LWSCM_HTTP2_SERVING)
@@ -157,21 +168,53 @@ lws_add_http_header_status(struct lws *wsi, unsigned int code,
 	if (code >= 500 && code < (500 + ARRAY_SIZE(err500)))
 		description = err500[code - 500];
 
-	n = sprintf((char *)code_and_desc, "HTTP/1.0 %u %s", code, description);
+	if (code == 200)
+		description = "OK";
 
-	return lws_add_http_header_by_name(wsi, NULL, code_and_desc,
-					   n, p, end);
+	if (code == 304)
+		description = "Not Modified";
+	else
+		if (code >= 300 && code < 400)
+			description = "Redirect";
+
+	if (wsi->u.http.request_version < ARRAY_SIZE(hver))
+		p1 = hver[wsi->u.http.request_version];
+	else
+		p1 = hver[0];
+
+	n = sprintf((char *)code_and_desc, "%s %u %s", p1, code, description);
+
+	if (lws_add_http_header_by_name(wsi, NULL, code_and_desc, n, p, end))
+		return 1;
+
+	headers = wsi->vhost->headers;
+	while (headers) {
+		if (lws_add_http_header_by_name(wsi,
+				(const unsigned char *)headers->name,
+				(unsigned char *)headers->value,
+				strlen(headers->value), p, end))
+			return 1;
+
+		headers = headers->next;
+	}
+
+	if (wsi->context->server_string &&
+	    !(_code & LWSAHH_FLAG_NO_SERVER_NAME))
+		if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_SERVER,
+				(unsigned char *)wsi->context->server_string,
+				wsi->context->server_string_len, p, end))
+			return 1;
+
+	if (wsi->vhost->options & LWS_SERVER_OPTION_STS)
+		if (lws_add_http_header_by_name(wsi, (unsigned char *)
+				"Strict-Transport-Security:",
+				(unsigned char *)"max-age=15768000 ; "
+				"includeSubDomains", 36, p, end))
+			return 1;
+
+	return 0;
 }
 
-/**
- * lws_return_http_status() - Return simple http status
- * @wsi:		Websocket instance (available from user callback)
- * @code:		Status index, eg, 404
- * @html_body:		User-readable HTML description < 1KB, or NULL
- *
- *	Helper to report HTTP errors back to the client cleanly and
- *	consistently
- */
 LWS_VISIBLE int
 lws_return_http_status(struct lws *wsi, unsigned int code,
 		       const char *html_body)
@@ -179,28 +222,25 @@ lws_return_http_status(struct lws *wsi, unsigned int code,
 	struct lws_context *context = lws_get_context(wsi);
 	struct lws_context_per_thread *pt = &context->pt[(int)wsi->tsi];
 	unsigned char *p = pt->serv_buf + LWS_PRE;
-	unsigned char *start = p, *body = p + 512;
-	unsigned char *end = p + LWS_MAX_SOCKET_IO_BUF - LWS_PRE;
-	int n, m, len;
+	unsigned char *start = p;
+	unsigned char *end = p + context->pt_serv_buf_size - LWS_PRE;
+	int n = 0, m, len;
 	char slen[20];
 
 	if (!html_body)
 		html_body = "";
 
-	len = sprintf((char *)body, "<html><body><h1>%u</h1>%s</body></html>",
-		      code, html_body);
-
 	if (lws_add_http_header_status(wsi, code, &p, end))
 		return 1;
-	if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_SERVER,
-					 (unsigned char *)"libwebsockets", 13,
-					 &p, end))
-		return 1;
+
 	if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_TYPE,
 					 (unsigned char *)"text/html", 9,
 					 &p, end))
 		return 1;
+
+	len = 37 + strlen(html_body) + sprintf(slen, "%d", code);
 	n = sprintf(slen, "%d", len);
+
 	if (lws_add_http_header_by_token(wsi, WSI_TOKEN_HTTP_CONTENT_LENGTH,
 					 (unsigned char *)slen, n,
 					 &p, end))
@@ -209,11 +249,69 @@ lws_return_http_status(struct lws *wsi, unsigned int code,
 	if (lws_finalize_http_header(wsi, &p, end))
 		return 1;
 
-	m = lws_write(wsi, start, p - start, LWS_WRITE_HTTP_HEADERS);
-	if (m != (int)(p - start))
-		return 1;
+#if defined(LWS_USE_HTTP2)
+	{
+		unsigned char *body = p + 512;
 
-	m = lws_write(wsi, body, len, LWS_WRITE_HTTP);
+		m = lws_write(wsi, start, p - start, LWS_WRITE_HTTP_HEADERS);
+		if (m != (int)(p - start))
+			return 1;
+
+		len = sprintf((char *)body, "<html><body><h1>%u</h1>%s</body></html>",
+		      code, html_body);
+
+		n = len;
+		m = lws_write(wsi, body, len, LWS_WRITE_HTTP);
+	}
+#else
+	p += lws_snprintf((char *)p, end - p - 1,
+			  "<html><body><h1>%u</h1>%s</body></html>",
+			  code, html_body);
+
+	n = (int)(p - start);
+	m = lws_write(wsi, start, n, LWS_WRITE_HTTP);
+	if (m != n)
+		return 1;
+#endif
 
 	return m != n;
+}
+
+LWS_VISIBLE int
+lws_http_redirect(struct lws *wsi, int code, const unsigned char *loc, int len,
+		  unsigned char **p, unsigned char *end)
+{
+	unsigned char *start = *p;
+	int n;
+
+	if (lws_add_http_header_status(wsi, code, p, end))
+		return -1;
+
+	if (lws_add_http_header_by_token(wsi,
+			WSI_TOKEN_HTTP_LOCATION,
+			loc, len, p, end))
+		return -1;
+	/*
+	 * if we're going with http/1.1 and keepalive,
+	 * we have to give fake content metadata so the
+	 * client knows we completed the transaction and
+	 * it can do the redirect...
+	 */
+	if (lws_add_http_header_by_token(wsi,
+			WSI_TOKEN_HTTP_CONTENT_TYPE,
+			(unsigned char *)"text/html", 9,
+			p, end))
+		return -1;
+	if (lws_add_http_header_by_token(wsi,
+			WSI_TOKEN_HTTP_CONTENT_LENGTH,
+			(unsigned char *)"0", 1, p, end))
+		return -1;
+
+	if (lws_finalize_http_header(wsi, p, end))
+		return -1;
+
+	n = lws_write(wsi, start, *p - start,
+			LWS_WRITE_HTTP_HEADERS);
+
+	return n;
 }

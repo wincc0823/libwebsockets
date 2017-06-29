@@ -45,28 +45,31 @@ child_handler(int signum)
 		break;
 
 	case SIGUSR1: /* positive confirmation we daemonized well */
-		/* Create the lock file as the current user */
 
-		fd = open(lock_path, O_TRUNC | O_RDWR | O_CREAT, 0640);
-		if (fd < 0) {
-			fprintf(stderr,
-			   "unable to create lock file %s, code=%d (%s)\n",
-				lock_path, errno, strerror(errno));
-			exit(5);
+		if (lock_path) {
+			/* Create the lock file as the current user */
+
+			fd = open(lock_path, O_TRUNC | O_RDWR | O_CREAT, 0640);
+			if (fd < 0) {
+				fprintf(stderr,
+				   "unable to create lock file %s, code=%d (%s)\n",
+					lock_path, errno, strerror(errno));
+				exit(0);
+			}
+			len = sprintf(sz, "%u", pid_daemon);
+			sent = write(fd, sz, len);
+			if (sent != len)
+				fprintf(stderr,
+				  "unable to write pid to lock file %s, code=%d (%s)\n",
+						     lock_path, errno, strerror(errno));
+
+			close(fd);
 		}
-		len = sprintf(sz, "%u", pid_daemon);
-		sent = write(fd, sz, len);
-		if (sent != len)
-			fprintf(stderr,
-			  "unable to write pid to lock file %s, code=%d (%s)\n",
-					     lock_path, errno, strerror(errno));
-
-		close(fd);
 		exit(0);
 		//!!(sent == len));
 
 	case SIGCHLD: /* daemonization failed */
-		exit(6);
+		exit(0);
 		break;
 	}
 }
@@ -102,32 +105,34 @@ lws_daemonize(const char *_lock_path)
 //	if (getppid() == 1)
 //		return 1;
 
-	fd = open(_lock_path, O_RDONLY);
-	if (fd >= 0) {
-		n = read(fd, buf, sizeof(buf));
-		close(fd);
-		if (n) {
-			n = atoi(buf);
-			ret = kill(n, 0);
-			if (ret >= 0) {
+	if (_lock_path) {
+		fd = open(_lock_path, O_RDONLY);
+		if (fd >= 0) {
+			n = read(fd, buf, sizeof(buf));
+			close(fd);
+			if (n) {
+				n = atoi(buf);
+				ret = kill(n, 0);
+				if (ret >= 0) {
+					fprintf(stderr,
+					     "Daemon already running from pid %d\n", n);
+					exit(1);
+				}
 				fprintf(stderr,
-				     "Daemon already running from pid %d\n", n);
-				exit(1);
+				    "Removing stale lock file %s from dead pid %d\n",
+									 _lock_path, n);
+				unlink(lock_path);
 			}
-			fprintf(stderr,
-			    "Removing stale lock file %s from dead pid %d\n",
-								 _lock_path, n);
-			unlink(lock_path);
 		}
-	}
 
-	n = strlen(_lock_path) + 1;
-	lock_path = lws_malloc(n);
-	if (!lock_path) {
-		fprintf(stderr, "Out of mem in lws_daemonize\n");
-		return 1;
+		n = strlen(_lock_path) + 1;
+		lock_path = lws_malloc(n);
+		if (!lock_path) {
+			fprintf(stderr, "Out of mem in lws_daemonize\n");
+			return 1;
+		}
+		strcpy(lock_path, _lock_path);
 	}
-	strcpy(lock_path, _lock_path);
 
 	/* Trap signals that we expect to receive */
 	signal(SIGCHLD, child_handler);	/* died */
@@ -142,20 +147,20 @@ lws_daemonize(const char *_lock_path)
 		exit(9);
 	}
 
-	/* If we got a good PID, then we can exit the parent process. */
+        /* If we got a good PID, then we can exit the parent process. */
 	if (pid_daemon > 0) {
 
-		/*
-		 * Wait for confirmation signal from the child via
-		 * SIGCHILD / USR1, or for two seconds to elapse
-		 * (SIGALRM).  pause() should not return.
-		 */
-		alarm(2);
+               /*
+                * Wait for confirmation signal from the child via
+                * SIGCHILD / USR1, or for two seconds to elapse
+                * (SIGALRM).  pause() should not return.
+                */
+               alarm(2);
 
-		pause();
-		/* should not be reachable */
-		exit(0);
-	}
+               pause();
+               /* should not be reachable */
+               exit(1);
+       }
 
 	/* At this point we are executing as the child process */
 	parent = getppid();
@@ -184,7 +189,7 @@ lws_daemonize(const char *_lock_path)
 	 * Change the current working directory.  This prevents the current
 	 * directory from being locked; hence not being able to remove it.
 	 */
-	if (chdir("/") < 0) {
+	if (chdir("/tmp") < 0) {
 		fprintf(stderr,
 			"unable to change directory to %s, code %d (%s)",
 			"/", errno, strerror(errno));

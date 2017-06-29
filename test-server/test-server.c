@@ -14,7 +14,7 @@
  * all without asking permission.
  *
  * The test apps are intended to be adapted for use in your code, which
- * may be proprietary.  So unlike the library itself, they are licensed
+ * may be proprietary.	So unlike the library itself, they are licensed
  * Public Domain.
  */
 
@@ -36,6 +36,37 @@ struct lws_plat_file_ops fops_plat;
 /* http server gets files from this path */
 #define LOCAL_RESOURCE_PATH INSTALL_DATADIR"/libwebsockets-test-server"
 char *resource_path = LOCAL_RESOURCE_PATH;
+#if defined(LWS_OPENSSL_SUPPORT) && defined(LWS_HAVE_SSL_CTX_set1_param)
+char crl_path[1024] = "";
+#endif
+
+/*
+ * This demonstrates how to use the clean protocol service separation of
+ * plugins, but with static inclusion instead of runtime dynamic loading
+ * (which requires libuv).
+ *
+ * dumb-increment doesn't use the plugin, both to demonstrate how to
+ * do the protocols directly, and because it wants libuv for a timer.
+ *
+ * Please consider using test-server-v2.0.c instead of this: it has the
+ * same functionality but
+ *
+ * 1) uses lws built-in http handling so you don't need to deal with it in
+ * your callback
+ *
+ * 2) Links with libuv and uses the plugins at runtime
+ *
+ * 3) Uses advanced lws features like mounts to bind parts of the filesystem
+ * to the served URL space
+ *
+ * Another option is lwsws, this operates like test-server-v2,0.c but is
+ * configured using JSON, do you do not need to provide any code for the
+ * serving action at all, just implement your protocols in plugins.
+ */
+
+#define LWS_PLUGIN_STATIC
+#include "../plugins/protocol_lws_mirror.c"
+#include "../plugins/protocol_lws_status.c"
 
 /* singlethreaded version --> no locks */
 
@@ -59,6 +90,9 @@ void test_server_unlock(int care)
  *
  *  lws-mirror-protocol: copies any received packet to every connection also
  *				using this protocol, including the sender
+ *
+ *  lws-status:			informs connected browsers of who else is
+ *				connected.
  */
 
 enum demo_protocols {
@@ -67,7 +101,6 @@ enum demo_protocols {
 
 	PROTOCOL_DUMB_INCREMENT,
 	PROTOCOL_LWS_MIRROR,
-	PROTOCOL_LWS_ECHOGEN,
 	PROTOCOL_LWS_STATUS,
 
 	/* always last */
@@ -89,47 +122,39 @@ static struct lws_protocols protocols[] = {
 		"dumb-increment-protocol",
 		callback_dumb_increment,
 		sizeof(struct per_session_data__dumb_increment),
-		10,
+		10, /* rx buf size must be >= permessage-deflate rx size
+		     * dumb-increment only sends very small packets, so we set
+		     * this accordingly.  If your protocol will send bigger
+		     * things, adjust this to match */
 	},
-	{
-		"lws-mirror-protocol",
-		callback_lws_mirror,
-		sizeof(struct per_session_data__lws_mirror),
-		128,
-	},
-	{
-		"lws-echogen",
-		callback_lws_echogen,
-		sizeof(struct per_session_data__echogen),
-		128,
-	},
-	{
-		"lws-status",
-		callback_lws_status,
-		sizeof(struct per_session_data__lws_status),
-		128,
-	},
+	LWS_PLUGIN_PROTOCOL_MIRROR,
+	LWS_PLUGIN_PROTOCOL_LWS_STATUS,
 	{ NULL, NULL, 0, 0 } /* terminator */
 };
 
 
-/* this shows how to override the lws file operations.  You don't need
+/* this shows how to override the lws file operations.	You don't need
  * to do any of this unless you have a reason (eg, want to serve
  * compressed files without decompressing the whole archive)
  */
-static lws_filefd_type
-test_server_fops_open(struct lws *wsi, const char *filename,
-		      unsigned long *filelen, int flags)
+static lws_fop_fd_t
+test_server_fops_open(const struct lws_plat_file_ops *fops,
+		     const char *vfs_path, const char *vpath,
+		     lws_fop_flags_t *flags)
 {
-	lws_filefd_type n;
+	lws_fop_fd_t fop_fd;
 
 	/* call through to original platform implementation */
-	n = fops_plat.open(wsi, filename, filelen, flags);
+	fop_fd = fops_plat.open(fops, vfs_path, vpath, flags);
 
-	lwsl_notice("%s: opening %s, ret %ld, len %lu\n", __func__, filename,
-			(long)n, *filelen);
+	if (fop_fd)
+		lwsl_info("%s: opening %s, ret %p, len %lu\n", __func__,
+				vfs_path, fop_fd,
+				(long)lws_vfs_get_length(fop_fd));
+	else
+		lwsl_info("%s: open %s failed\n", __func__, vfs_path);
 
-	return n;
+	return fop_fd;
 }
 
 void sighandler(int sig)
@@ -160,22 +185,30 @@ static struct option options[] = {
 	{ "port",	required_argument,	NULL, 'p' },
 	{ "ssl",	no_argument,		NULL, 's' },
 	{ "allow-non-ssl",	no_argument,	NULL, 'a' },
-	{ "interface",  required_argument,	NULL, 'i' },
-	{ "closetest",  no_argument,		NULL, 'c' },
+	{ "interface",	required_argument,	NULL, 'i' },
+	{ "closetest",	no_argument,		NULL, 'c' },
 	{ "ssl-cert",  required_argument,	NULL, 'C' },
 	{ "ssl-key",  required_argument,	NULL, 'K' },
 	{ "ssl-ca",  required_argument,		NULL, 'A' },
+#if defined(LWS_OPENSSL_SUPPORT)
+	{ "ssl-verify-client",	no_argument,		NULL, 'v' },
+#if defined(LWS_HAVE_SSL_CTX_set1_param)
+	{ "ssl-crl",  required_argument,		NULL, 'R' },
+#endif
+#endif
 	{ "libev",  no_argument,		NULL, 'e' },
 #ifndef LWS_NO_DAEMONIZE
-	{ "daemonize", 	no_argument,		NULL, 'D' },
+	{ "daemonize",	no_argument,		NULL, 'D' },
 #endif
 	{ "resource_path", required_argument,	NULL, 'r' },
+	{ "pingpong-secs", required_argument,	NULL, 'P' },
 	{ NULL, 0, 0, 0 }
 };
 
 int main(int argc, char **argv)
 {
 	struct lws_context_creation_info info;
+	struct lws_vhost *vhost;
 	char interface_name[128] = "";
 	unsigned int ms, oldms = 0;
 	const char *iface = NULL;
@@ -184,13 +217,19 @@ int main(int argc, char **argv)
 	char ca_path[1024] = "";
 	int uid = -1, gid = -1;
 	int use_ssl = 0;
+	int pp_secs = 0;
 	int opts = 0;
 	int n = 0;
 #ifndef _WIN32
+/* LOG_PERROR is not POSIX standard, and may not be portable */
+#ifdef __sun
+	int syslog_options = LOG_PID;
+#else	     
 	int syslog_options = LOG_PID | LOG_PERROR;
 #endif
+#endif
 #ifndef LWS_NO_DAEMONIZE
- 	int daemonize = 0;
+	int daemonize = 0;
 #endif
 
 	/*
@@ -201,7 +240,7 @@ int main(int argc, char **argv)
 	info.port = 7681;
 
 	while (n >= 0) {
-		n = getopt_long(argc, argv, "eci:hsap:d:Dr:C:K:A:u:g:", options, NULL);
+		n = getopt_long(argc, argv, "eci:hsap:d:Dr:C:K:A:R:vu:g:P:k", options, NULL);
 		if (n < 0)
 			continue;
 		switch (n) {
@@ -211,7 +250,7 @@ int main(int argc, char **argv)
 #ifndef LWS_NO_DAEMONIZE
 		case 'D':
 			daemonize = 1;
-			#ifndef _WIN32
+			#if !defined(_WIN32) && !defined(__sun)
 			syslog_options &= ~LOG_PERROR;
 			#endif
 			break;
@@ -239,6 +278,13 @@ int main(int argc, char **argv)
 			interface_name[(sizeof interface_name) - 1] = '\0';
 			iface = interface_name;
 			break;
+		case 'k':
+			info.bind_iface = 1;
+#if defined(LWS_HAVE_SYS_CAPABILITY_H) && defined(LWS_HAVE_LIBCAP)
+			info.caps[0] = CAP_NET_RAW;
+			info.count_caps = 1;
+#endif
+			break;
 		case 'c':
 			close_testing = 1;
 			fprintf(stderr, " Close testing mode -- closes on "
@@ -250,14 +296,34 @@ int main(int argc, char **argv)
 			printf("Setting resource path to \"%s\"\n", resource_path);
 			break;
 		case 'C':
-			strncpy(cert_path, optarg, sizeof cert_path);
+			strncpy(cert_path, optarg, sizeof(cert_path) - 1);
+			cert_path[sizeof(cert_path) - 1] = '\0';
 			break;
 		case 'K':
-			strncpy(key_path, optarg, sizeof key_path);
+			strncpy(key_path, optarg, sizeof(key_path) - 1);
+			key_path[sizeof(key_path) - 1] = '\0';
 			break;
 		case 'A':
-			strncpy(ca_path, optarg, sizeof ca_path);
+			strncpy(ca_path, optarg, sizeof(ca_path) - 1);
+			ca_path[sizeof(ca_path) - 1] = '\0';
 			break;
+		case 'P':
+			pp_secs = atoi(optarg);
+			lwsl_notice("Setting pingpong interval to %d\n", pp_secs);
+			break;
+#if defined(LWS_OPENSSL_SUPPORT)
+		case 'v':
+			use_ssl = 1;
+			opts |= LWS_SERVER_OPTION_REQUIRE_VALID_OPENSSL_CLIENT_CERT;
+			break;
+
+#if defined(LWS_HAVE_SSL_CTX_set1_param)
+		case 'R':
+			strncpy(crl_path, optarg, sizeof(crl_path) - 1);
+			crl_path[sizeof(crl_path) - 1] = '\0';
+			break;
+#endif
+#endif
 		case 'h':
 			fprintf(stderr, "Usage: test-server "
 					"[--port=<p>] [--ssl] "
@@ -308,6 +374,7 @@ int main(int argc, char **argv)
 	info.protocols = protocols;
 	info.ssl_cert_filepath = NULL;
 	info.ssl_private_key_filepath = NULL;
+	info.ws_ping_pong_interval = pp_secs;
 
 	if (use_ssl) {
 		if (strlen(resource_path) > sizeof(cert_path) - 32) {
@@ -333,7 +400,7 @@ int main(int argc, char **argv)
 	info.gid = gid;
 	info.uid = uid;
 	info.max_http_header_pool = 16;
-	info.options = opts | LWS_SERVER_OPTION_VALIDATE_UTF8;
+	info.options = opts | LWS_SERVER_OPTION_VALIDATE_UTF8 | LWS_SERVER_OPTION_EXPLICIT_VHOSTS | LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
 	info.extensions = exts;
 	info.timeout_secs = 5;
 	info.ssl_cipher_list = "ECDHE-ECDSA-AES256-GCM-SHA384:"
@@ -360,7 +427,17 @@ int main(int argc, char **argv)
 		return -1;
 	}
 
-	/* this shows how to override the lws file operations.  You don't need
+	vhost = lws_create_vhost(context, &info);
+	if (!vhost) {
+		lwsl_err("vhost creation failed\n");
+		return -1;
+	}
+
+#if !defined(LWS_NO_CLIENT) && defined(LWS_OPENSSL_SUPPORT)
+	lws_init_vhost_client_ssl(&info, vhost);
+#endif
+
+	/* this shows how to override the lws file operations.	You don't need
 	 * to do any of this unless you have a reason (eg, want to serve
 	 * compressed files without decompressing the whole archive)
 	 */
@@ -370,6 +447,9 @@ int main(int argc, char **argv)
 	lws_get_fops(context)->open = test_server_fops_open;
 
 	n = 0;
+#ifdef EXTERNAL_POLL
+	int ms_1sec = 0;
+#endif
 	while (n >= 0 && !force_exit) {
 		struct timeval tv;
 
@@ -398,7 +478,7 @@ int main(int argc, char **argv)
 		if (n < 0)
 			continue;
 
-		if (n)
+		if (n) {
 			for (n = 0; n < count_pollfds; n++)
 				if (pollfds[n].revents)
 					/*
@@ -409,6 +489,20 @@ int main(int argc, char **argv)
 					if (lws_service_fd(context,
 								  &pollfds[n]) < 0)
 						goto done;
+
+			/* if needed, force-service wsis that may not have read all input */
+			while (!lws_service_adjust_timeout(context, 1, 0)) {
+				lwsl_notice("extpoll doing forced service!\n");
+				lws_service_tsi(context, -1, 0);
+			}
+		} else {
+			/* no revents, but before polling again, make lws check for any timeouts */
+			if (ms - ms_1sec > 1000) {
+				lwsl_notice("1 per sec\n");
+				lws_service_fd(context, NULL);
+				ms_1sec = ms;
+			}
+		}
 #else
 		/*
 		 * If libwebsockets sockets are all we care about,

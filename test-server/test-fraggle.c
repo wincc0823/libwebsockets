@@ -335,6 +335,7 @@ int main(int argc, char **argv)
 	info.gid = -1;
 	info.uid = -1;
 	info.options = opts;
+	info.extensions = exts;
 
 	if (use_ssl)
 		info.options |= LWS_SERVER_OPTION_DO_SSL_GLOBAL_INIT;
@@ -349,7 +350,7 @@ int main(int argc, char **argv)
 		struct lws_client_connect_info i;
 
 		address = argv[optind];
-		snprintf(ads_port, sizeof(ads_port), "%s:%u",
+		lws_snprintf(ads_port, sizeof(ads_port), "%s:%u",
 			 address, port & 65535);
 		memset(&i, 0, sizeof(i));
 		i.context = context;
@@ -360,7 +361,6 @@ int main(int argc, char **argv)
 		i.host = ads_port;
 		i.origin = ads_port;
 		i.protocol = protocols[PROTOCOL_FRAGGLE].name;
-		i.client_exts = exts;
 
 		lwsl_notice("Connecting to %s:%u\n", address, port);
 		wsi = lws_client_connect_via_info(&i);

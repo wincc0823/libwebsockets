@@ -87,20 +87,20 @@ alpn_cb(SSL *s, const unsigned char **out, unsigned char *outlen,
 #endif
 
 LWS_VISIBLE void
-lws_context_init_http2_ssl(struct lws_context *context)
+lws_context_init_http2_ssl(struct lws_vhost *vhost)
 {
 #if OPENSSL_VERSION_NUMBER >= 0x10002000L
-	static struct alpn_ctx protos = { (unsigned char *)"\x05h2-14"
+	static struct alpn_ctx protos = { (unsigned char *)"\x02h2"
 					  "\x08http/1.1", 6 + 9 };
 
-	SSL_CTX_set_next_protos_advertised_cb(context->ssl_ctx, npn_cb, &protos);
+	SSL_CTX_set_next_protos_advertised_cb(vhost->ssl_ctx, npn_cb, &protos);
 
 	// ALPN selection callback
-	SSL_CTX_set_alpn_select_cb(context->ssl_ctx, alpn_cb, &protos);
+	SSL_CTX_set_alpn_select_cb(vhost->ssl_ctx, alpn_cb, &protos);
 	lwsl_notice(" HTTP2 / ALPN enabled\n");
 #else
 	lwsl_notice(
-		" HTTP2 / ALPN configured but not supported by OpenSSL 0x%x\n",
+		" HTTP2 / ALPN configured but not supported by OpenSSL 0x%lx\n",
 		    OPENSSL_VERSION_NUMBER);
 #endif // OPENSSL_VERSION_NUMBER >= 0x10002000L
 }

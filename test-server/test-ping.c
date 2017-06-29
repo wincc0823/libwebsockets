@@ -14,7 +14,7 @@
  * all without asking permission.
  *
  * The test apps are intended to be adapted for use in your code, which
- * may be proprietary.  So unlike the library itself, they are licensed
+ * may be proprietary.	So unlike the library itself, they are licensed
  * Public Domain.
  */
 
@@ -40,6 +40,10 @@
 
 #ifdef __ANDROID__
 #include <termiosh>
+#endif
+
+#ifdef __sun
+#include <sys/termios.h>
 #endif
 
 /*
@@ -78,7 +82,7 @@ struct ping {
 };
 
 struct per_session_data__ping {
-	uint64_t ping_index;
+	unsigned long long ping_index;
 
 	struct ping ringbuffer[PING_RINGBUFFER_SIZE];
 	int ringbuffer_head;
@@ -110,7 +114,7 @@ callback_lws_mirror(struct lws *wsi, enum lws_callback_reasons reason,
 	unsigned char *p;
 	unsigned long iv;
 	int match = 0;
-	uint64_t l;
+	unsigned long long l;
 	int shift;
 	int n;
 
@@ -158,7 +162,7 @@ callback_lws_mirror(struct lws *wsi, enum lws_callback_reasons reason,
 		l = 0;
 
 		while (shift >= 0) {
-			l |= ((uint64_t)*p++) << shift;
+			l |= ((unsigned long long)*p++) << shift;
 			shift -= 8;
 		}
 
@@ -396,7 +400,7 @@ int main(int argc, char **argv)
 		case 'r':
 			clients = atoi(optarg);
 			if (clients > MAX_PING_CLIENTS || clients < 1) {
-				fprintf(stderr, "Max clients supportd = %d\n",
+				fprintf(stderr, "Max clients supported = %d\n",
 							      MAX_PING_CLIENTS);
 				return 1;
 			}
@@ -453,7 +457,7 @@ int main(int argc, char **argv)
 	/* create client websockets using dumb increment protocol */
 
 	address = argv[optind];
-	snprintf(ads_port, sizeof(ads_port), "%s:%u",
+	lws_snprintf(ads_port, sizeof(ads_port), "%s:%u",
 		 address, port & 65535);
 	lwsl_notice("Connecting to %s...\n", ads_port);
 	memset(&i, 0, sizeof(i));
@@ -465,7 +469,6 @@ int main(int argc, char **argv)
 	i.host = ads_port;
 	i.origin = ads_port;
 	i.protocol = protocols[PROTOCOL_LWS_MIRROR].name;
-	i.client_exts = exts;
 	i.ietf_version_or_minus_one = ietf_version;
 
 	for (n = 0; n < clients; n++) {

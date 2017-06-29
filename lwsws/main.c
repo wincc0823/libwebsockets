@@ -3,72 +3,59 @@
  *
  * Copyright (C) 2010-2016 Andy Green <andy@warmcat.com>
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public
- * License as published by the Free Software Foundation:
- * version 2.1 of the License.
+ * This file is made available under the Creative Commons CC0 1.0
+ * Universal Public Domain Dedication.
  *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * General Public License for more details.
+ * The person who associated a work with this deed has dedicated
+ * the work to the public domain by waiving all of his or her rights
+ * to the work worldwide under copyright law, including all related
+ * and neighboring rights, to the extent allowed by law. You can copy,
+ * modify, distribute and perform the work, even for commercial purposes,
+ * all without asking permission.
  *
- * You should have received a copy of the GNU General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
- * MA  02110-1301  USA
+ * The test apps are intended to be adapted for use in your code, which
+ * may be proprietary.	So unlike the library itself, they are licensed
+ * Public Domain.
  */
+#include "lws_config.h"
 
-#include "lwsws.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <getopt.h>
+#include <signal.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <assert.h>
+#ifndef _WIN32
+#include <dirent.h>
+#include <syslog.h>
+#include <sys/time.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#else
+#include <io.h>
+#include "gettimeofday.h"
 
-int debug_level = 7;
+int fork(void)
+{
+	fprintf(stderr, "Sorry Windows doesn't support fork().\n");
+	return 0;
+}
+#endif
 
-volatile int force_exit = 0;
-struct lws_context *context;
+#include "../lib/libwebsockets.h"
 
-static char *config_dir = "/etc/lwsws/conf.d";
+#include <uv.h>
 
-/*
- * strings and objects from the config file parsing are created here
- */
+static struct lws_context *context;
+static char config_dir[128];
+static int opts = 0, do_reload = 1;
+static uv_loop_t loop;
+static uv_signal_t signal_outer;
+static int pids[32];
+
 #define LWSWS_CONFIG_STRING_SIZE (32 * 1024)
-char config_strings[LWSWS_CONFIG_STRING_SIZE];
-
-/* singlethreaded version --> no locks */
-
-void test_server_lock(int care)
-{
-}
-void test_server_unlock(int care)
-{
-}
-
-
-enum demo_protocols {
-	/* always first */
-	PROTOCOL_HTTP = 0,
-
-	/* always last */
-	DEMO_PROTOCOL_COUNT
-};
-
-/* list of supported protocols and callbacks */
-
-static struct lws_protocols protocols[] = {
-	/* first protocol must always be HTTP handler */
-	{
-		"http-only",		/* name */
-		callback_http,		/* callback */
-		sizeof (struct per_session_data__http),	/* per_session_data_size */
-		0,			/* max frame size / rx buffer */
-	},
-};
-
-void sighandler(int sig)
-{
-	force_exit = 1;
-	lws_cancel_service(context);
-}
 
 static const struct lws_extension exts[] = {
 	{
@@ -79,61 +66,151 @@ static const struct lws_extension exts[] = {
 	{ NULL, NULL, NULL /* terminator */ }
 };
 
+static const char * const plugin_dirs[] = {
+	INSTALL_DATADIR"/libwebsockets-test-server/plugins/",
+	NULL
+};
+
 static struct option options[] = {
 	{ "help",	no_argument,		NULL, 'h' },
 	{ "debug",	required_argument,	NULL, 'd' },
 	{ "configdir",  required_argument,	NULL, 'c' },
-#ifndef LWS_NO_DAEMONIZE
-	{ "daemonize", 	no_argument,		NULL, 'D' },
-#endif
 	{ NULL, 0, 0, 0 }
 };
 
-#ifdef LWS_USE_LIBUV
 void signal_cb(uv_signal_t *watcher, int signum)
 {
-	lwsl_err("Signal %d caught, exiting...\n", watcher->signum);
 	switch (watcher->signum) {
 	case SIGTERM:
 	case SIGINT:
 		break;
+
+	case SIGHUP:
+		if (lws_context_is_deprecated(context))
+			return;
+		lwsl_notice("Dropping listen sockets\n");
+		lws_context_deprecate(context, NULL);
+		return;
+
 	default:
 		signal(SIGABRT, SIG_DFL);
 		abort();
 		break;
 	}
+	lwsl_err("Signal %d caught\n", watcher->signum);
 	lws_libuv_stop(context);
 }
+
+static int
+context_creation(void)
+{
+	int cs_len = LWSWS_CONFIG_STRING_SIZE - 1;
+	struct lws_context_creation_info info;
+	char *cs, *config_strings;
+
+	cs = config_strings = malloc(LWSWS_CONFIG_STRING_SIZE);
+	if (!config_strings) {
+		lwsl_err("Unable to allocate config strings heap\n");
+		return -1;
+	}
+
+	memset(&info, 0, sizeof(info));
+
+	info.external_baggage_free_on_destroy = config_strings;
+	info.max_http_header_pool = 16;
+	info.options = opts | LWS_SERVER_OPTION_VALIDATE_UTF8 |
+			      LWS_SERVER_OPTION_EXPLICIT_VHOSTS |
+			      LWS_SERVER_OPTION_LIBUV;
+
+	info.plugin_dirs = plugin_dirs;
+	lwsl_notice("Using config dir: \"%s\"\n", config_dir);
+
+	/*
+	 *  first go through the config for creating the outer context
+	 */
+	if (lwsws_get_config_globals(&info, config_dir, &cs, &cs_len))
+		goto init_failed;
+
+	context = lws_create_context(&info);
+	if (context == NULL) {
+		lwsl_err("libwebsocket init failed\n");
+		goto init_failed;
+	}
+
+	lws_uv_sigint_cfg(context, 1, signal_cb);
+	lws_uv_initloop(context, &loop, 0);
+
+	/*
+	 * then create the vhosts... protocols are entirely coming from
+	 * plugins, so we leave it NULL
+	 */
+
+	info.extensions = exts;
+
+	if (lwsws_get_config_vhosts(context, &info, config_dir,
+				    &cs, &cs_len))
+		return 1;
+
+	return 0;
+
+init_failed:
+	free(config_strings);
+
+	return 1;
+}
+
+
+/*
+ * root-level sighup handler
+ */
+
+static void
+reload_handler(int signum)
+{
+#ifndef _WIN32
+	int m;
+
+	switch (signum) {
+
+	case SIGHUP: /* reload */
+		fprintf(stderr, "root process receives reload\n");
+		if (!do_reload) {
+			fprintf(stderr, "passing HUP to child processes\n");
+			for (m = 0; m < ARRAY_SIZE(pids); m++)
+				if (pids[m])
+					kill(pids[m], SIGHUP);
+			sleep(1);
+		}
+		do_reload = 1;
+		break;
+	case SIGINT:
+	case SIGTERM:
+	case SIGKILL:
+		fprintf(stderr, "killing service processes\n");
+		for (m = 0; m < ARRAY_SIZE(pids); m++)
+			if (pids[m])
+				kill(pids[m], SIGTERM);
+		exit(0);
+	}
+#else
+	// kill() implementation needed for WIN32
 #endif
+}
 
 int main(int argc, char **argv)
 {
-	struct lws_context_creation_info info;
-	char *cs = config_strings;
-	int opts = 0, cs_len = sizeof(config_strings) - 1;
-	int n = 0;
+	int n = 0, debug_level = 7;
 #ifndef _WIN32
-	int syslog_options = LOG_PID | LOG_PERROR;
-#endif
-#ifndef LWS_NO_DAEMONIZE
- 	int daemonize = 0;
+	int m;
+	int status, syslog_options = LOG_PID | LOG_PERROR;
 #endif
 
-	memset(&info, 0, sizeof info);
-
+	strcpy(config_dir, "/etc/lwsws");
 	while (n >= 0) {
-		n = getopt_long(argc, argv, "hd:c:D", options, NULL);
+		n = getopt_long(argc, argv, "hd:c:", options, NULL);
 		if (n < 0)
 			continue;
 		switch (n) {
-#ifndef LWS_NO_DAEMONIZE
-		case 'D':
-			daemonize = 1;
-			#ifndef _WIN32
-			syslog_options &= ~LOG_PERROR;
-			#endif
-			break;
-#endif
 		case 'd':
 			debug_level = atoi(optarg);
 			break;
@@ -147,20 +224,52 @@ int main(int argc, char **argv)
 			exit(1);
 		}
 	}
-
-#if !defined(LWS_NO_DAEMONIZE) && !defined(WIN32)
+#ifndef _WIN32
 	/*
-	 * normally lock path would be /var/lock/lwsts or similar, to
-	 * simplify getting started without having to take care about
-	 * permissions or running as root, set to /tmp/.lwsts-lock
+	 * We leave our original process up permanently, because that
+	 * suits systemd.
+	 *
+	 * Otherwise we get into problems when reload spawns new processes and
+	 * the original one dies randomly.
 	 */
-	if (daemonize && lws_daemonize("/tmp/.lwsts-lock")) {
-		fprintf(stderr, "Failed to daemonize\n");
-		return 10;
+
+	signal(SIGHUP, reload_handler);
+	signal(SIGINT, reload_handler);
+
+	fprintf(stderr, "Root process is %u\n", getpid());
+
+	while (1) {
+		if (do_reload) {
+			do_reload = 0;
+			n = fork();
+			if (n == 0) /* new */
+				break;
+			/* old */
+			if (n > 0)
+				for (m = 0; m < ARRAY_SIZE(pids); m++)
+					if (!pids[m]) {
+						// fprintf(stderr, "added child pid %d\n", n);
+						pids[m] = n;
+						break;
+					}
+		}
+#ifndef _WIN32
+		sleep(2);
+
+		n = waitpid(-1, &status, WNOHANG);
+		if (n > 0)
+			for (m = 0; m < ARRAY_SIZE(pids); m++)
+				if (pids[m] == n) {
+					// fprintf(stderr, "reaped child pid %d\n", pids[m]);
+					pids[m] = 0;
+					break;
+				}
+#else
+// !!! implemenation needed
+#endif
 	}
 #endif
-
-	signal(SIGINT, sighandler);
+	/* child process */
 
 #ifndef _WIN32
 	/* we will only try to log things according to our debug_level */
@@ -170,65 +279,38 @@ int main(int argc, char **argv)
 
 	lws_set_log_level(debug_level, lwsl_emit_syslog);
 
-	lwsl_notice("lwsws libwebsockets web server - license GPL2.1\n");
+	lwsl_notice("lwsws libwebsockets web server - license CC0 + LGPL2.1\n");
 	lwsl_notice("(C) Copyright 2010-2016 Andy Green <andy@warmcat.com>\n");
 
-	memset(&info, 0, sizeof(info));
-
-	info.max_http_header_pool = 16;
-	info.options = opts | LWS_SERVER_OPTION_VALIDATE_UTF8 |
-		LWS_SERVER_OPTION_EXPLICIT_VHOSTS;
-#ifdef LWS_USE_LIBUV
-	info.options |= LWS_SERVER_OPTION_LIBUV;
-#endif
-
-	lwsl_notice("Using config dir: \"%s\"\n", config_dir);
-
-	/*
-	 *  first go through the config for creating the outer context
-	 */
-
-	if (lwsws_get_config_globals(&info, config_dir, &cs, &cs_len))
-		goto bail;
-
-	context = lws_create_context(&info);
-	if (context == NULL) {
-		lwsl_err("libwebsocket init failed\n");
-		return -1;
-	}
-
-	/*
-	 * then create the vhosts...
-	 *
-	 * protocols and extensions are the global list of possible
-	 * protocols and extensions offered serverwide.  The vhosts
-	 * in the config files enable the ones they want to offer
-	 * per vhost.
-	 *
-	 * The first protocol is always included for http support.
-	 */
-
-	info.protocols = protocols;
-	info.extensions = exts;
-
-	if (lwsws_get_config_vhosts(context, &info, config_dir, &cs, &cs_len))
-		goto bail;
-
-#ifdef LWS_USE_LIBUV
-	lws_uv_sigint_cfg(context, 1, signal_cb);
-	lws_uv_initloop(context, NULL, 0);
-	lws_libuv_run(context, 0);
+#if (UV_VERSION_MAJOR > 0) // Travis...
+	uv_loop_init(&loop);
 #else
+	fprintf(stderr, "Your libuv is too old!\n");
+	return 0;
+#endif
+	uv_signal_init(&loop, &signal_outer);
+	uv_signal_start(&signal_outer, signal_cb, SIGINT);
+	uv_signal_start(&signal_outer, signal_cb, SIGHUP);
 
-	n = 0;
-	while (n >= 0 && !force_exit) {
-		n = lws_service(context, 50);
+	if (context_creation()) {
+		lwsl_err("Context creation failed\n");
+		return 1;
 	}
+
+	lws_libuv_run(context, 0);
+
+	uv_signal_stop(&signal_outer);
+	lws_context_destroy(context);
+
+#if (UV_VERSION_MAJOR > 0) // Travis...
+	n = 0;
+	while (n++ < 1024 && uv_loop_close(&loop))
+		uv_run(&loop, UV_RUN_NOWAIT);
 #endif
 
-bail:
-	lws_context_destroy(context);
-	lwsl_notice("lwsws exited cleanly\n");
+	lws_context_destroy2(context);
+
+	fprintf(stderr, "lwsws exited cleanly\n");
 
 #ifndef _WIN32
 	closelog();

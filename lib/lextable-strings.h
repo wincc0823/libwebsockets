@@ -1,6 +1,10 @@
 /* set of parsable strings -- ALL LOWER CASE */
 
-static const char *set[] = {
+#if !defined(STORE_IN_ROM)
+#define STORE_IN_ROM
+#endif
+
+STORE_IN_ROM static const char * const set[] = {
 	"get ",
 	"post ",
 	"options ",
@@ -40,11 +44,11 @@ static const char *set[] = {
 	"sec-websocket-version:",
 	"sec-websocket-origin:",
 
-	":authority:",
-	":method:",
-	":path:",
-	":scheme:",
-	":status:",
+	":authority",
+	":method",
+	":path",
+	":scheme",
+	":status",
 
 	"accept-charset:",
 	"accept-ranges:",
@@ -89,6 +93,9 @@ static const char *set[] = {
 	"proxy ",
 	"x-real-ip:",
 	"http/1.0 ",
+
+	"x-forwarded-for",
+	"connect ",
 
 	"", /* not matchable */
 

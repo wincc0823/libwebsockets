@@ -21,9 +21,13 @@
 
 #include "private-libwebsockets.h"
 
+/*
+ * parsers.c: lws_rx_sm() needs to be roughly kept in
+ *   sync with changes here, esp related to ext draining
+ */
+
 int lws_client_rx_sm(struct lws *wsi, unsigned char c)
 {
-	struct lws_context_per_thread *pt = &wsi->context->pt[(int)wsi->tsi];
 	int callback_action = LWS_CALLBACK_CLIENT_RECEIVE;
 	int handled, n, m, rx_draining_ext = 0;
 	unsigned short close_code;
@@ -31,25 +35,18 @@ int lws_client_rx_sm(struct lws *wsi, unsigned char c)
 	unsigned char *pp;
 
 	if (wsi->u.ws.rx_draining_ext) {
-		struct lws **w = &pt->rx_draining_ext_list;
-		lwsl_ext("%s: RX EXT DRAINING: Removing from list\n", __func__, c);
 		assert(!c);
 		eff_buf.token = NULL;
 		eff_buf.token_len = 0;
-		wsi->u.ws.rx_draining_ext = 0;
-		/* remove us from context draining ext list */
-		while (*w) {
-			if (*w == wsi) {
-				*w = wsi->u.ws.rx_draining_ext_list;
-				break;
-			}
-			w = &((*w)->u.ws.rx_draining_ext_list);
-		}
-		wsi->u.ws.rx_draining_ext_list = NULL;
+		lws_remove_wsi_from_draining_ext_list(wsi);
 		rx_draining_ext = 1;
+		lwsl_debug("%s: doing draining flow\n", __func__);
 
 		goto drain_extension;
 	}
+
+	if (wsi->socket_is_permanently_unusable)
+		return -1;
 
 	switch (wsi->lws_rx_parse_state) {
 	case LWS_RXPS_NEW:
@@ -308,6 +305,9 @@ int lws_client_rx_sm(struct lws *wsi, unsigned char c)
 
 		assert(wsi->u.ws.rx_ubuf);
 
+		if (wsi->u.ws.rx_draining_ext)
+			goto drain_extension;
+
 		if (wsi->u.ws.this_frame_masked && !wsi->u.ws.all_zero_nonce)
 			c ^= wsi->u.ws.mask[(wsi->u.ws.mask_idx++) & 3];
 
@@ -321,10 +321,10 @@ int lws_client_rx_sm(struct lws *wsi, unsigned char c)
 
 		/*
 		 * if there's no protocol max frame size given, we are
-		 * supposed to default to LWS_MAX_SOCKET_IO_BUF
+		 * supposed to default to context->pt_serv_buf_size
 		 */
 		if (!wsi->protocol->rx_buffer_size &&
-		    wsi->u.ws.rx_ubuf_head != LWS_MAX_SOCKET_IO_BUF)
+		    wsi->u.ws.rx_ubuf_head != wsi->context->pt_serv_buf_size)
 			break;
 
 		if (wsi->protocol->rx_buffer_size &&
@@ -365,10 +365,14 @@ spill:
 						 wsi->u.ws.rx_ubuf_head);
 			if (wsi->u.ws.rx_ubuf_head >= 2) {
 				close_code = (pp[0] << 8) | pp[1];
-				if (close_code < 1000 || close_code == 1004 ||
-				    close_code == 1005 || close_code == 1006 ||
-				    close_code == 1012 || close_code == 1013 ||
-				    close_code == 1014 || close_code == 1015 ||
+				if (close_code < 1000 ||
+				    close_code == 1004 ||
+				    close_code == 1005 ||
+				    close_code == 1006 ||
+				    close_code == 1012 ||
+				    close_code == 1013 ||
+				    close_code == 1014 ||
+				    close_code == 1015 ||
 				    (close_code >= 1016 && close_code < 3000)
 				) {
 					pp[0] = (LWS_CLOSE_STATUS_PROTOCOL_ERR >> 8) & 0xff;
@@ -381,13 +385,23 @@ spill:
 					wsi->user_space, pp,
 					wsi->u.ws.rx_ubuf_head))
 				return -1;
-			/*
-			 * parrot the close packet payload back
-			 * we do not care about how it went, we are closing
-			 * immediately afterwards
-			 */
-			lws_write(wsi, (unsigned char *)&wsi->u.ws.rx_ubuf[LWS_PRE],
-				  wsi->u.ws.rx_ubuf_head, LWS_WRITE_CLOSE);
+
+			if (lws_partial_buffered(wsi))
+				/*
+				 * if we're in the middle of something,
+				 * we can't do a normal close response and
+				 * have to just close our end.
+				 */
+				wsi->socket_is_permanently_unusable = 1;
+			else
+				/*
+				 * parrot the close packet payload back
+				 * we do not care about how it went, we are closing
+				 * immediately afterwards
+				 */
+				lws_write(wsi, (unsigned char *)&wsi->u.ws.rx_ubuf[LWS_PRE],
+					  wsi->u.ws.rx_ubuf_head,
+					  LWS_WRITE_CLOSE);
 			wsi->state = LWSS_RETURNED_CLOSE_ALREADY;
 			/* close the connection */
 			return -1;
@@ -434,6 +448,11 @@ ping_drop:
 			lwsl_info("client receied pong\n");
 			lwsl_hexdump(&wsi->u.ws.rx_ubuf[LWS_PRE],
 				     wsi->u.ws.rx_ubuf_head);
+
+			if (wsi->pending_timeout == PENDING_TIMEOUT_WS_PONG_CHECK_GET_PONG) {
+				lwsl_info("received expected PONG on wsi %p\n", wsi);
+				lws_set_timeout(wsi, NO_PENDING_TIMEOUT, 0);
+			}
 
 			/* issue it */
 			callback_action = LWS_CALLBACK_CLIENT_RECEIVE_PONG;
@@ -482,10 +501,14 @@ ping_drop:
 		eff_buf.token_len = wsi->u.ws.rx_ubuf_head;
 
 drain_extension:
+		lwsl_ext("%s: passing %d to ext\n", __func__, eff_buf.token_len);
+
 		n = lws_ext_cb_active(wsi, LWS_EXT_CB_PAYLOAD_RX, &eff_buf, 0);
 		lwsl_ext("Ext RX returned %d\n", n);
-		if (n < 0) /* fail */
+		if (n < 0) {
+			wsi->socket_is_permanently_unusable = 1;
 			return -1;
+		}
 
 		lwsl_ext("post inflate eff_buf len %d\n", eff_buf.token_len);
 
@@ -501,7 +524,8 @@ drain_extension:
 				goto utf8_fail;
 
 			/* we are ending partway through utf-8 character? */
-			if (!wsi->u.ws.rx_packet_length && wsi->u.ws.final && wsi->u.ws.utf8 && !n) {
+			if (!wsi->u.ws.rx_packet_length && wsi->u.ws.final &&
+			    wsi->u.ws.utf8 && !n) {
 				lwsl_info("FINAL utf8 error\n");
 utf8_fail:			lwsl_info("utf8 error\n");
 				return -1;
@@ -523,17 +547,16 @@ utf8_fail:			lwsl_info("utf8 error\n");
 		if (callback_action == LWS_CALLBACK_CLIENT_RECEIVE_PONG)
 			lwsl_info("Client doing pong callback\n");
 
-		if (n && eff_buf.token_len) {
+		if (n && eff_buf.token_len)
 			/* extension had more... main loop will come back
 			 * we want callback to be done with this set, if so,
 			 * because lws_is_final() hides it was final until the
 			 * last chunk
 			 */
-			wsi->u.ws.rx_draining_ext = 1;
-			wsi->u.ws.rx_draining_ext_list = pt->rx_draining_ext_list;
-			pt->rx_draining_ext_list = wsi;
-			lwsl_ext("%s: RX EXT DRAINING: Adding to list\n", __func__);
-		}
+			lws_add_wsi_to_draining_ext_list(wsi);
+		else
+			lws_remove_wsi_from_draining_ext_list(wsi);
+
 		if (wsi->state == LWSS_RETURNED_CLOSE_ALREADY ||
 		    wsi->state == LWSS_AWAITING_CLOSE_ACK)
 			goto already_done;

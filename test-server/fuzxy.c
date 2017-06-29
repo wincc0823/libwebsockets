@@ -16,7 +16,7 @@
  *  You should have received a copy of the GNU Lesser General Public
  *  License along with this library; if not, write to the Free Software
  *  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
- *  MA  02110-1301  USA
+ *  MA	02110-1301  USA
  *
  *
  * fuzxy is designed to go on the client path
@@ -64,6 +64,10 @@
 
 #if defined(__NetBSD__)
 #include <netinet/in.h>
+#endif
+
+#if defined(__sun)
+#include <strings.h> /* bzero */
 #endif
 
 #define MAX_FUZZ_BUF (1024 * 1024)
@@ -259,19 +263,19 @@ static const struct test tests[] = {
 	  }, { 0, 4 }, 1 },
 };
 
-static const int ring_size(struct ring *r)
+static int ring_size(struct ring *r)
 {
 	return sizeof(r->buf);
 }
-static const int ring_used(struct ring *r)
+static int ring_used(struct ring *r)
 {
 	return (r->head - r->tail) & (ring_size(r) - 1);
 }
-static const int ring_free(struct ring *r)
+static int ring_free(struct ring *r)
 {
 	return (ring_size(r) - 1) - ring_used(r);
 }
-static const int ring_get_one(struct ring *r)
+static int ring_get_one(struct ring *r)
 {
 	int n = r->buf[r->tail] & 255;
 
@@ -394,11 +398,11 @@ static struct option options[] = {
 	{ "port",	required_argument,	NULL, 'p' },
 	{ "ssl",	no_argument,		NULL, 's' },
 	{ "allow-non-ssl",	no_argument,	NULL, 'a' },
-	{ "interface",  required_argument,	NULL, 'i' },
-	{ "closetest",  no_argument,		NULL, 'c' },
+	{ "interface",	required_argument,	NULL, 'i' },
+	{ "closetest",	no_argument,		NULL, 'c' },
 	{ "libev",  no_argument,		NULL, 'e' },
 #ifndef LWS_NO_DAEMONIZE
-	{ "daemonize", 	no_argument,		NULL, 'D' },
+	{ "daemonize",	no_argument,		NULL, 'D' },
 #endif
 	{ "resource_path", required_argument,	NULL, 'r' },
 	{ NULL, 0, 0, 0 }
@@ -486,7 +490,7 @@ fuzxy_listen(const char *interface_name, int port, int *sockfd)
 
 	if (interface_name[0] &&
 	    lws_interface_to_sa(0, interface_name, (struct sockaddr_in *)
-			        (struct sockaddr *)&serv_addr4,
+				(struct sockaddr *)&serv_addr4,
 				sizeof(serv_addr4)) < 0) {
 		lwsl_err("Unable to find interface %s\n", interface_name);
 		goto bail2;
@@ -756,10 +760,15 @@ main(int argc, char **argv)
 	int n = 0, m;
 
 #ifndef _WIN32
+/* LOG_PERROR is not POSIX standard, and may not be portable */
+#ifdef __sun
+	int syslog_options = LOG_PID;
+#else
 	int syslog_options = LOG_PID | LOG_PERROR;
 #endif
+#endif
 #ifndef LWS_NO_DAEMONIZE
- 	int daemonize = 0;
+	int daemonize = 0;
 #endif
 	signal(SIGPIPE, sigpipe_handler);
 
@@ -774,7 +783,7 @@ main(int argc, char **argv)
 #ifndef LWS_NO_DAEMONIZE
 		case 'D':
 			daemonize = 1;
-			#ifndef _WIN32
+			#if !defined(_WIN32) && !defined(__sun)
 			syslog_options &= ~LOG_PERROR;
 			#endif
 			break;
@@ -833,6 +842,7 @@ main(int argc, char **argv)
 	construct_state(pfds, FZY_S_LISTENING, POLLIN | POLLERR);
 	pfds++;
 
+	(void)interface_name_local;
 	lwsl_notice("Local side listening on %s:%u\n",
 		    interface_name_local, port_local);
 
@@ -913,8 +923,8 @@ main(int argc, char **argv)
 					/*
 					 * draw down enough of the partner's
 					 * in ring to either exhaust it
- 					 * or fill an output buffer
- 					 */
+					 * or fill an output buffer
+					 */
 					m = fuzz(n, out, sizeof(out));
 					if (m < 0) {
 						lwsl_err("Error on fuzz\n");

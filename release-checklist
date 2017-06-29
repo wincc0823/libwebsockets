@@ -28,7 +28,7 @@ Release Checklist
      Force update by browser using agent "libwebsockets"
      http://localhost:8080/test_browser.html
      
-     scp -rp ./reports to libwebsockets.org
+     rsync -av ./reports/* root@warmcat.com:/var/www/libwebsockets.org
 
 1) api
 
@@ -82,11 +82,16 @@ Release Checklist
 - Bump version to 1.6.4
 - MINOR fix xyz
 
-6) signed tag
+6) update api docs
+
+ $ cmake ..
+ $ cp doc/* ..
+
+7) signed tag
 
   git tag -s vX.Y[.Z]
 
-7) git
+8) git
 
  a) push
  

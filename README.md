@@ -1,9 +1,21 @@
-[![Travis Build Status](https://travis-ci.org/warmcat/libwebsockets.png)](https://travis-ci.org/warmcat/libwebsockets)
-[![Appveyor Build status](https://ci.appveyor.com/api/projects/status/qfasji8mnfnd2r8t)](https://ci.appveyor.com/project/warmcat/libwebsockets)
+[![Travis Build Status](https://travis-ci.org/warmcat/libwebsockets.svg)](https://travis-ci.org/warmcat/libwebsockets)
+[![Appveyor Build status](https://ci.appveyor.com/api/projects/status/qfasji8mnfnd2r8t?svg=true)](https://ci.appveyor.com/project/lws-team/libwebsockets)
 [![Coverity Scan Build Status](https://scan.coverity.com/projects/3576/badge.svg)](https://scan.coverity.com/projects/3576)
 
 libwebsockets
 -------------
+
+News
+----
+
+ESP32 is now supported in lws!  Download the
+
+ - factory https://github.com/warmcat/lws-esp32-factory and
+ - test server app https://github.com/warmcat/lws-esp32-test-server-demos
+
+v2.2 is out... see the changelog https://github.com/warmcat/libwebsockets/blob/v2.2-stable/changelog
+
+
 
 This is the libwebsockets C library for lightweight websocket clients and
 servers.  For support, visit
@@ -15,20 +27,13 @@ and consider joining the project mailing list at
 
  https://libwebsockets.org/mailman/listinfo/libwebsockets
 
-| News |
-------
-| We have updated https://libwebsockets.org, if you would like your project using lws featured in the image carousel, send an image, project URL and brief summary to andy@warmcat.com |
-
 You can get the latest version of the library from git:
 
 - https://github.com/warmcat/libwebsockets
 - https://libwebsockets.org/git
 
-for more information:
+Doxygen API docs for master: https://libwebsockets.org/lws-api-doc-master/html/index.html
 
-- [README.build.md](README.build.md) - information on building the library
-- [README.coding.md](README.coding.md) - information for writing code using the library
-- [README.test-apps.md](README.test-apps.md) - information about the test apps built with the library
 
 After libwebsockets 1.3, tags will be signed using a key corresponding to this public key
 

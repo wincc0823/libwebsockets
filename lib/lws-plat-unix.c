@@ -3,6 +3,12 @@
 #include <pwd.h>
 #include <grp.h>
 
+#ifdef LWS_WITH_PLUGINS
+#include <dlfcn.h>
+#endif
+#include <dirent.h>
+
+
 /*
  * included from libwebsockets.c for unix builds
  */
@@ -29,7 +35,7 @@ lws_send_pipe_choked(struct lws *wsi)
 	if (wsi->trunc_len)
 		return 1;
 
-	fds.fd = wsi->sock;
+	fds.fd = wsi->desc.sockfd;
 	fds.events = POLLOUT;
 	fds.revents = 0;
 
@@ -50,23 +56,6 @@ lws_poll_listen_fd(struct lws_pollfd *fd)
 	return poll(fd, 1, 0);
 }
 
-/*
- * This is just used to interrupt poll waiting
- * we don't have to do anything with it.
- */
-static void
-lws_sigusr2(int sig)
-{
-}
-
-/**
- * lws_cancel_service_pt() - Cancel servicing of pending socket activity
- *				on one thread
- * @wsi:	Cancel service on the thread this wsi is serviced by
- *
- *	This function let a call to lws_service() waiting for a timeout
- *	immediately return.
- */
 LWS_VISIBLE void
 lws_cancel_service_pt(struct lws *wsi)
 {
@@ -77,13 +66,6 @@ lws_cancel_service_pt(struct lws *wsi)
 		lwsl_err("Cannot write to dummy pipe");
 }
 
-/**
- * lws_cancel_service() - Cancel ALL servicing of pending socket activity
- * @context:	Websocket context
- *
- *	This function let a call to lws_service() waiting for a timeout
- *	immediately return.
- */
 LWS_VISIBLE void
 lws_cancel_service(struct lws_context *context)
 {
@@ -118,11 +100,11 @@ LWS_VISIBLE void lwsl_emit_syslog(int level, const char *line)
 	syslog(syslog_level, "%s", line);
 }
 
-LWS_VISIBLE int
-lws_plat_service_tsi(struct lws_context *context, int timeout_ms, int tsi)
+LWS_VISIBLE LWS_EXTERN int
+_lws_plat_service_tsi(struct lws_context *context, int timeout_ms, int tsi)
 {
-	struct lws_context_per_thread *pt = &context->pt[tsi];
-	int n, m, c;
+	struct lws_context_per_thread *pt;
+	int n = -1, m, c;
 	char buf;
 
 	/* stay dead once we are dead */
@@ -130,8 +112,16 @@ lws_plat_service_tsi(struct lws_context *context, int timeout_ms, int tsi)
 	if (!context || !context->vhost_list)
 		return 1;
 
+	pt = &context->pt[tsi];
+
+	lws_stats_atomic_bump(context, pt, LWSSTATS_C_SERVICE_ENTRY, 1);
+
+	if (timeout_ms < 0)
+		goto faked_service;
+
 	lws_libev_run(context, tsi);
 	lws_libuv_run(context, tsi);
+	lws_libevent_run(context, tsi);
 
 	if (!context->service_tid_detected) {
 		struct lws _lws;
@@ -139,12 +129,23 @@ lws_plat_service_tsi(struct lws_context *context, int timeout_ms, int tsi)
 		memset(&_lws, 0, sizeof(_lws));
 		_lws.context = context;
 
-		context->service_tid_detected = context->vhost_list->protocols[0].callback(
+		context->service_tid_detected =
+			context->vhost_list->protocols[0].callback(
 			&_lws, LWS_CALLBACK_GET_THREAD_ID, NULL, NULL, 0);
 	}
 	context->service_tid = context->service_tid_detected;
 
-	timeout_ms = lws_service_adjust_timeout(context, timeout_ms, tsi);
+	/*
+	 * is there anybody with pending stuff that needs service forcing?
+	 */
+	if (!lws_service_adjust_timeout(context, 1, tsi)) {
+		/* -1 timeout means just do forced service */
+		_lws_plat_service_tsi(context, -1, pt->tid);
+		/* still somebody left who wants forced service? */
+		if (!lws_service_adjust_timeout(context, 1, pt->tid))
+			/* yes... come back again quickly */
+			timeout_ms = 0;
+	}
 
 	n = poll(pt->fds, pt->fds_count, timeout_ms);
 
@@ -158,6 +159,7 @@ lws_plat_service_tsi(struct lws_context *context, int timeout_ms, int tsi)
 		return 0;
 	}
 
+faked_service:
 	m = lws_service_flag_pending(context, tsi);
 	if (m)
 		c = -1; /* unknown limit */
@@ -194,9 +196,15 @@ lws_plat_service_tsi(struct lws_context *context, int timeout_ms, int tsi)
 }
 
 LWS_VISIBLE int
+lws_plat_check_connection_error(struct lws *wsi)
+{
+	return 0;
+}
+
+LWS_VISIBLE int
 lws_plat_service(struct lws_context *context, int timeout_ms)
 {
-	return lws_plat_service_tsi(context, timeout_ms, 0);
+	return _lws_plat_service_tsi(context, timeout_ms, 0);
 }
 
 LWS_VISIBLE int
@@ -222,7 +230,7 @@ lws_plat_set_socket_options(struct lws_vhost *vhost, int fd)
 #if defined(__APPLE__) || \
     defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || \
     defined(__NetBSD__) || \
-        defined(__CYGWIN__) || defined(__OpenBSD__)
+        defined(__CYGWIN__) || defined(__OpenBSD__) || defined (__sun)
 
 		/*
 		 * didn't find a way to set these per-socket, need to
@@ -247,12 +255,26 @@ lws_plat_set_socket_options(struct lws_vhost *vhost, int fd)
 #endif
 	}
 
+#if defined(SO_BINDTODEVICE)
+	if (vhost->bind_iface) {
+		lwsl_info("binding listen skt to %s using SO_BINDTODEVICE\n", vhost->iface);
+		if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, vhost->iface,
+				strlen(vhost->iface)) < 0) {
+			lwsl_warn("Failed to bind to device %s\n", vhost->iface);
+			return 1;
+		}
+	}
+#endif
+
 	/* Disable Nagle */
 	optval = 1;
-#if !defined(__APPLE__) && \
-    !defined(__FreeBSD__) && !defined(__FreeBSD_kernel__) && \
-    !defined(__NetBSD__) && \
-    !defined(__OpenBSD__)
+#if defined (__sun)
+	if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const void *)&optval, optlen) < 0)
+		return 1;
+#elif !defined(__APPLE__) && \
+      !defined(__FreeBSD__) && !defined(__FreeBSD_kernel__) &&        \
+      !defined(__NetBSD__) && \
+      !defined(__OpenBSD__)
 	if (setsockopt(fd, SOL_TCP, TCP_NODELAY, (const void *)&optval, optlen) < 0)
 		return 1;
 #else
@@ -268,9 +290,29 @@ lws_plat_set_socket_options(struct lws_vhost *vhost, int fd)
 	return 0;
 }
 
+#if defined(LWS_HAVE_SYS_CAPABILITY_H) && defined(LWS_HAVE_LIBCAP)
+static void
+_lws_plat_apply_caps(int mode, cap_value_t *cv, int count)
+{
+	cap_t caps = cap_get_proc();
+
+	if (!count)
+		return;
+
+	cap_set_flag(caps, mode, count, cv, CAP_SET);
+	cap_set_proc(caps);
+	prctl(PR_SET_KEEPCAPS, 1, 0, 0, 0);
+	cap_free(caps);
+}
+#endif
+
 LWS_VISIBLE void
 lws_plat_drop_app_privileges(struct lws_context_creation_info *info)
 {
+#if defined(LWS_HAVE_SYS_CAPABILITY_H) && defined(LWS_HAVE_LIBCAP)
+	int n;
+#endif
+
 	if (info->gid != -1)
 		if (setgid(info->gid))
 			lwsl_warn("setgid: %s\n", strerror(LWS_ERRNO));
@@ -279,33 +321,192 @@ lws_plat_drop_app_privileges(struct lws_context_creation_info *info)
 		struct passwd *p = getpwuid(info->uid);
 
 		if (p) {
+
+#if defined(LWS_HAVE_SYS_CAPABILITY_H) && defined(LWS_HAVE_LIBCAP)
+			_lws_plat_apply_caps(CAP_PERMITTED, info->caps, info->count_caps);
+#endif
+
 			initgroups(p->pw_name, info->gid);
 			if (setuid(info->uid))
 				lwsl_warn("setuid: %s\n", strerror(LWS_ERRNO));
 			else
 				lwsl_notice("Set privs to user '%s'\n", p->pw_name);
+
+#if defined(LWS_HAVE_SYS_CAPABILITY_H) && defined(LWS_HAVE_LIBCAP)
+			_lws_plat_apply_caps(CAP_EFFECTIVE, info->caps, info->count_caps);
+
+			if (info->count_caps)
+				for (n = 0; n < info->count_caps; n++)
+					lwsl_notice("   RETAINING CAPABILITY %d\n", (int)info->caps[n]);
+#endif
+
 		} else
 			lwsl_warn("getpwuid: unable to find uid %d", info->uid);
 	}
 }
 
-static void
-sigpipe_handler(int x)
+#ifdef LWS_WITH_PLUGINS
+
+#if defined(LWS_USE_LIBUV) && UV_VERSION_MAJOR > 0
+
+/* libuv.c implements these in a cross-platform way */
+
+#else
+
+static int filter(const struct dirent *ent)
 {
+	if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, ".."))
+		return 0;
+
+	return 1;
 }
+
+LWS_VISIBLE int
+lws_plat_plugins_init(struct lws_context * context, const char * const *d)
+{
+	struct lws_plugin_capability lcaps;
+	struct lws_plugin *plugin;
+	lws_plugin_init_func initfunc;
+	struct dirent **namelist;
+	int n, i, m, ret = 0;
+	char path[256];
+	void *l;
+
+	lwsl_notice("  Plugins:\n");
+
+	while (d && *d) {
+		n = scandir(*d, &namelist, filter, alphasort);
+		if (n < 0) {
+			lwsl_err("Scandir on %s failed\n", *d);
+			return 1;
+		}
+
+		for (i = 0; i < n; i++) {
+			if (strlen(namelist[i]->d_name) < 7)
+				goto inval;
+
+			lwsl_notice("   %s\n", namelist[i]->d_name);
+
+			lws_snprintf(path, sizeof(path) - 1, "%s/%s", *d,
+				 namelist[i]->d_name);
+			l = dlopen(path, RTLD_NOW);
+			if (!l) {
+				lwsl_err("Error loading DSO: %s\n", dlerror());
+				while (i++ < n)
+					free(namelist[i]);
+				goto bail;
+			}
+			/* we could open it, can we get his init function? */
+			m = lws_snprintf(path, sizeof(path) - 1, "init_%s",
+				     namelist[i]->d_name + 3 /* snip lib... */);
+			path[m - 3] = '\0'; /* snip the .so */
+			initfunc = dlsym(l, path);
+			if (!initfunc) {
+				lwsl_err("Failed to get init on %s: %s",
+						namelist[i]->d_name, dlerror());
+				dlclose(l);
+			}
+			lcaps.api_magic = LWS_PLUGIN_API_MAGIC;
+			m = initfunc(context, &lcaps);
+			if (m) {
+				lwsl_err("Initializing %s failed %d\n",
+					namelist[i]->d_name, m);
+				dlclose(l);
+				goto skip;
+			}
+
+			plugin = lws_malloc(sizeof(*plugin));
+			if (!plugin) {
+				lwsl_err("OOM\n");
+				goto bail;
+			}
+			plugin->list = context->plugin_list;
+			context->plugin_list = plugin;
+			strncpy(plugin->name, namelist[i]->d_name, sizeof(plugin->name) - 1);
+			plugin->name[sizeof(plugin->name) - 1] = '\0';
+			plugin->l = l;
+			plugin->caps = lcaps;
+			context->plugin_protocol_count += lcaps.count_protocols;
+			context->plugin_extension_count += lcaps.count_extensions;
+
+			free(namelist[i]);
+			continue;
+
+	skip:
+			dlclose(l);
+	inval:
+			free(namelist[i]);
+		}
+		free(namelist);
+		d++;
+	}
+
+bail:
+	free(namelist);
+
+	return ret;
+}
+
+LWS_VISIBLE int
+lws_plat_plugins_destroy(struct lws_context * context)
+{
+	struct lws_plugin *plugin = context->plugin_list, *p;
+	lws_plugin_destroy_func func;
+	char path[256];
+	int m;
+
+	if (!plugin)
+		return 0;
+
+	lwsl_notice("%s\n", __func__);
+
+	while (plugin) {
+		p = plugin;
+		m = lws_snprintf(path, sizeof(path) - 1, "destroy_%s", plugin->name + 3);
+		path[m - 3] = '\0';
+		func = dlsym(plugin->l, path);
+		if (!func) {
+			lwsl_err("Failed to get destroy on %s: %s",
+					plugin->name, dlerror());
+			goto next;
+		}
+		m = func(context);
+		if (m)
+			lwsl_err("Initializing %s failed %d\n",
+				plugin->name, m);
+next:
+		dlclose(p->l);
+		plugin = p->list;
+		p->list = NULL;
+		free(p);
+	}
+
+	context->plugin_list = NULL;
+
+	return 0;
+}
+
+#endif
+#endif
+
+
+#if 0
+static void
+sigabrt_handler(int x)
+{
+	printf("%s\n", __func__);
+	//*(char *)0 = 0;
+}
+#endif
 
 LWS_VISIBLE int
 lws_plat_context_early_init(void)
 {
-	sigset_t mask;
+#if !defined(LWS_AVOID_SIGPIPE_IGN)
+	signal(SIGPIPE, SIG_IGN);
+#endif
 
-	signal(SIGUSR2, lws_sigusr2);
-	sigemptyset(&mask);
-	sigaddset(&mask, SIGUSR2);
-
-	sigprocmask(SIG_BLOCK, &mask, NULL);
-
-	signal(SIGPIPE, sigpipe_handler);
+//	signal(SIGABRT, sigabrt_handler);
 
 	return 0;
 }
@@ -321,15 +522,25 @@ lws_plat_context_late_destroy(struct lws_context *context)
 	struct lws_context_per_thread *pt = &context->pt[0];
 	int m = context->count_threads;
 
+#ifdef LWS_WITH_PLUGINS
+	if (context->plugin_list)
+		lws_plat_plugins_destroy(context);
+#endif
+
 	if (context->lws_lookup)
 		lws_free(context->lws_lookup);
 
 	while (m--) {
-		close(pt->dummy_pipe_fds[0]);
-		close(pt->dummy_pipe_fds[1]);
+		if (pt->dummy_pipe_fds[0])
+			close(pt->dummy_pipe_fds[0]);
+		if (pt->dummy_pipe_fds[1])
+			close(pt->dummy_pipe_fds[1]);
 		pt++;
 	}
-	close(context->fd_random);
+	if (!context->fd_random)
+		lwsl_err("ZERO RANDOM FD\n");
+	if (context->fd_random != LWS_INVALID_FILE)
+		close(context->fd_random);
 }
 
 /* cast a struct sockaddr_in6 * into addr for ipv6 */
@@ -390,7 +601,7 @@ lws_interface_to_sa(int ipv6, const char *ifname, struct sockaddr_in *addr,
 	freeifaddrs(ifr);
 
 	if (rc == -1) {
-		/* check if bind to IP adddress */
+		/* check if bind to IP address */
 #ifdef LWS_USE_IPV6
 		if (inet_pton(AF_INET6, ifname, &addr6->sin6_addr) == 1)
 			rc = 0;
@@ -410,6 +621,7 @@ lws_plat_insert_socket_into_fds(struct lws_context *context, struct lws *wsi)
 
 	lws_libev_io(wsi, LWS_EV_START | LWS_EV_READ);
 	lws_libuv_io(wsi, LWS_EV_START | LWS_EV_READ);
+	lws_libevent_io(wsi, LWS_EV_START | LWS_EV_READ);
 
 	pt->fds[pt->fds_count++].revents = 0;
 }
@@ -419,6 +631,11 @@ lws_plat_delete_socket_from_fds(struct lws_context *context,
 						struct lws *wsi, int m)
 {
 	struct lws_context_per_thread *pt = &context->pt[(int)wsi->tsi];
+
+	lws_libev_io(wsi, LWS_EV_STOP | LWS_EV_READ | LWS_EV_WRITE);
+	lws_libuv_io(wsi, LWS_EV_STOP | LWS_EV_READ | LWS_EV_WRITE);
+	lws_libevent_io(wsi, LWS_EV_STOP | LWS_EV_READ | LWS_EV_WRITE);
+
 	pt->fds_count--;
 }
 
@@ -444,69 +661,114 @@ lws_plat_inet_ntop(int af, const void *src, char *dst, int cnt)
 	return inet_ntop(af, src, dst, cnt);
 }
 
-static lws_filefd_type
-_lws_plat_file_open(struct lws *wsi, const char *filename,
-		    unsigned long *filelen, int flags)
+LWS_VISIBLE int
+lws_plat_inet_pton(int af, const char *src, void *dst)
 {
-	struct stat stat_buf;
-	int ret = open(filename, flags, 0664);
-
-	if (ret < 0)
-		return LWS_INVALID_FILE;
-
-	if (fstat(ret, &stat_buf) < 0) {
-		close(ret);
-		return LWS_INVALID_FILE;
-	}
-	*filelen = stat_buf.st_size;
-	return ret;
+	return inet_pton(af, src, dst);
 }
 
-static int
-_lws_plat_file_close(struct lws *wsi, lws_filefd_type fd)
+LWS_VISIBLE lws_fop_fd_t
+_lws_plat_file_open(const struct lws_plat_file_ops *fops, const char *filename,
+		    const char *vpath, lws_fop_flags_t *flags)
 {
+	struct stat stat_buf;
+	int ret = open(filename, (*flags) & LWS_FOP_FLAGS_MASK, 0664);
+	lws_fop_fd_t fop_fd;
+
+	if (ret < 0)
+		return NULL;
+
+	if (fstat(ret, &stat_buf) < 0)
+		goto bail;
+
+	fop_fd = malloc(sizeof(*fop_fd));
+	if (!fop_fd)
+		goto bail;
+
+	fop_fd->fops = fops;
+	fop_fd->flags = *flags;
+	fop_fd->fd = ret;
+	fop_fd->filesystem_priv = NULL; /* we don't use it */
+	fop_fd->len = stat_buf.st_size;
+	fop_fd->pos = 0;
+
+	return fop_fd;
+
+bail:
+	close(ret);
+	return NULL;
+}
+
+LWS_VISIBLE int
+_lws_plat_file_close(lws_fop_fd_t *fop_fd)
+{
+	int fd = (*fop_fd)->fd;
+
+	free(*fop_fd);
+	*fop_fd = NULL;
+
 	return close(fd);
 }
 
-unsigned long
-_lws_plat_file_seek_cur(struct lws *wsi, lws_filefd_type fd, long offset)
+LWS_VISIBLE lws_fileofs_t
+_lws_plat_file_seek_cur(lws_fop_fd_t fop_fd, lws_fileofs_t offset)
 {
-	return lseek(fd, offset, SEEK_CUR);
+	lws_fileofs_t r;
+
+	if (offset > 0 && offset > fop_fd->len - fop_fd->pos)
+		offset = fop_fd->len - fop_fd->pos;
+
+	if ((lws_fileofs_t)fop_fd->pos + offset < 0)
+		offset = -fop_fd->pos;
+
+	r = lseek(fop_fd->fd, offset, SEEK_CUR);
+
+	if (r >= 0)
+		fop_fd->pos = r;
+	else
+		lwsl_err("error seeking from cur %ld, offset %ld\n",
+                        (long)fop_fd->pos, (long)offset);
+
+	return r;
 }
 
-static int
-_lws_plat_file_read(struct lws *wsi, lws_filefd_type fd, unsigned long *amount,
-		    unsigned char *buf, unsigned long len)
+LWS_VISIBLE int
+_lws_plat_file_read(lws_fop_fd_t fop_fd, lws_filepos_t *amount,
+		    uint8_t *buf, lws_filepos_t len)
 {
 	long n;
 
-	n = read((int)fd, buf, len);
+	n = read((int)fop_fd->fd, buf, len);
 	if (n == -1) {
 		*amount = 0;
 		return -1;
 	}
-
+	fop_fd->pos += n;
+	lwsl_debug("%s: read %ld of req %ld, pos %ld, len %ld\n", __func__, n,
+                  (long)len, (long)fop_fd->pos, (long)fop_fd->len);
 	*amount = n;
 
 	return 0;
 }
 
-static int
-_lws_plat_file_write(struct lws *wsi, lws_filefd_type fd, unsigned long *amount,
-		     unsigned char *buf, unsigned long len)
+LWS_VISIBLE int
+_lws_plat_file_write(lws_fop_fd_t fop_fd, lws_filepos_t *amount,
+		     uint8_t *buf, lws_filepos_t len)
 {
 	long n;
 
-	n = write((int)fd, buf, len);
+	n = write((int)fop_fd->fd, buf, len);
 	if (n == -1) {
 		*amount = 0;
 		return -1;
 	}
 
+	fop_fd->pos += n;
 	*amount = n;
 
 	return 0;
 }
+
 
 LWS_VISIBLE int
 lws_plat_init(struct lws_context *context,
@@ -524,8 +786,8 @@ lws_plat_init(struct lws_context *context,
 		return 1;
 	}
 
-	lwsl_notice(" mem: platform fd map: %5u bytes\n",
-		    sizeof(struct lws *) * context->max_fds);
+	lwsl_notice(" mem: platform fd map: %5lu bytes\n",
+		    (unsigned long)(sizeof(struct lws *) * context->max_fds));
 	fd = open(SYSTEM_RANDOM_FILEPATH, O_RDONLY);
 
 	context->fd_random = fd;
@@ -536,7 +798,8 @@ lws_plat_init(struct lws_context *context,
 	}
 
 	if (!lws_libev_init_fd_table(context) &&
-	    !lws_libuv_init_fd_table(context)) {
+	    !lws_libuv_init_fd_table(context) &&
+	    !lws_libevent_init_fd_table(context)) {
 		/* otherwise libev handled it instead */
 
 		while (n--) {
@@ -554,11 +817,10 @@ lws_plat_init(struct lws_context *context,
 		}
 	}
 
-	context->fops.open	= _lws_plat_file_open;
-	context->fops.close	= _lws_plat_file_close;
-	context->fops.seek_cur	= _lws_plat_file_seek_cur;
-	context->fops.read	= _lws_plat_file_read;
-	context->fops.write	= _lws_plat_file_write;
+#ifdef LWS_WITH_PLUGINS
+	if (info->plugin_dirs)
+		lws_plat_plugins_init(context, info->plugin_dirs);
+#endif
 
 	return 0;
 }

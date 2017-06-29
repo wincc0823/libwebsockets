@@ -14,7 +14,7 @@
  * all without asking permission.
  *
  * The test apps are intended to be adapted for use in your code, which
- * may be proprietary.  So unlike the library itself, they are licensed
+ * may be proprietary.	So unlike the library itself, they are licensed
  * Public Domain.
  */
 
@@ -33,9 +33,17 @@ int count_pollfds;
 volatile int force_exit = 0;
 struct lws_context *context;
 
+#if defined(LWS_OPENSSL_SUPPORT) && defined(LWS_HAVE_SSL_CTX_set1_param)
+char crl_path[1024] = "";
+#endif
+
+#define LWS_PLUGIN_STATIC
+#include "../plugins/protocol_lws_mirror.c"
+#include "../plugins/protocol_lws_status.c"
+
 /*
  * This mutex lock protects code that changes or relies on wsi list outside of
- * the service thread.  The service thread will acquire it when changing the
+ * the service thread.	The service thread will acquire it when changing the
  * wsi list and other threads should acquire it while dereferencing wsis or
  * calling apis like lws_callback_on_writable_all_protocol() which
  * use the wsi list and wsis from a different thread context.
@@ -83,6 +91,7 @@ enum demo_protocols {
 
 	PROTOCOL_DUMB_INCREMENT,
 	PROTOCOL_LWS_MIRROR,
+	PROTOCOL_LWS_STATUS,
 
 	/* always last */
 	DEMO_PROTOCOL_COUNT
@@ -103,14 +112,13 @@ static struct lws_protocols protocols[] = {
 		"dumb-increment-protocol",
 		callback_dumb_increment,
 		sizeof(struct per_session_data__dumb_increment),
-		10,
+		10, /* rx buf size must be >= permessage-deflate rx size
+		     * dumb-increment only sends very small packets, so we set
+		     * this accordingly.  If your protocol will send bigger
+		     * things, adjust this to match */
 	},
-	{
-		"lws-mirror-protocol",
-		callback_lws_mirror,
-		sizeof(struct per_session_data__lws_mirror),
-		128,
-	},
+	LWS_PLUGIN_PROTOCOL_MIRROR,
+	LWS_PLUGIN_PROTOCOL_LWS_STATUS,
 	{ NULL, NULL, 0, 0 } /* terminator */
 };
 
@@ -166,12 +174,12 @@ static struct option options[] = {
 	{ "port",	required_argument,	NULL, 'p' },
 	{ "ssl",	no_argument,		NULL, 's' },
 	{ "allow-non-ssl",	no_argument,	NULL, 'a' },
-	{ "interface",  required_argument,	NULL, 'i' },
-	{ "closetest",  no_argument,		NULL, 'c' },
+	{ "interface",	required_argument,	NULL, 'i' },
+	{ "closetest",	no_argument,		NULL, 'c' },
 	{ "libev",  no_argument,		NULL, 'e' },
 	{ "threads",  required_argument,	NULL, 'j' },
 #ifndef LWS_NO_DAEMONIZE
-	{ "daemonize", 	no_argument,		NULL, 'D' },
+	{ "daemonize",	no_argument,		NULL, 'D' },
 #endif
 	{ "resource_path", required_argument,	NULL, 'r' },
 	{ NULL, 0, 0, 0 }
@@ -185,16 +193,21 @@ int main(int argc, char **argv)
 	pthread_t pthread_dumb, pthread_service[32];
 	char cert_path[1024];
 	char key_path[1024];
- 	int threads = 1;
+	int threads = 1;
 	int use_ssl = 0;
 	void *retval;
 	int opts = 0;
 	int n = 0;
 #ifndef _WIN32
+/* LOG_PERROR is not POSIX standard, and may not be portable */
+#ifdef __sun
+	int syslog_options = LOG_PID;
+#else
 	int syslog_options = LOG_PID | LOG_PERROR;
 #endif
+#endif
 #ifndef LWS_NO_DAEMONIZE
- 	int daemonize = 0;
+	int daemonize = 0;
 #endif
 
 	/*
@@ -214,8 +227,8 @@ int main(int argc, char **argv)
 		case 'j':
 			threads = atoi(optarg);
 			if (threads > ARRAY_SIZE(pthread_service)) {
-				lwsl_err("Max threads %d\n",
-					 ARRAY_SIZE(pthread_service));
+				lwsl_err("Max threads %lu\n",
+					 (unsigned long)ARRAY_SIZE(pthread_service));
 				return 1;
 			}
 			break;
@@ -225,7 +238,7 @@ int main(int argc, char **argv)
 #ifndef LWS_NO_DAEMONIZE
 		case 'D':
 			daemonize = 1;
-			#ifndef _WIN32
+			#if !defined(_WIN32) && !defined(__sun)
 			syslog_options &= ~LOG_PERROR;
 			#endif
 			break;

@@ -60,13 +60,13 @@
  */
 
 LWS_VISIBLE int
-lws_read(struct lws *wsi, unsigned char *buf, size_t len)
+lws_read(struct lws *wsi, unsigned char *buf, lws_filepos_t len)
 {
 	unsigned char *last_char, *oldbuf = buf;
-	int body_chunk_len;
+	lws_filepos_t body_chunk_len;
 	size_t n;
 
-	lwsl_debug("%s: incoming len %d\n", __func__, (int)len);
+	lwsl_debug("%s: incoming len %d  state %d\n", __func__, (int)len, wsi->state);
 
 	switch (wsi->state) {
 #ifdef LWS_USE_HTTP2
@@ -87,31 +87,43 @@ lws_read(struct lws *wsi, unsigned char *buf, size_t len)
 			/* account for what we're using in rxflow buffer */
 			if (wsi->rxflow_buffer)
 				wsi->rxflow_pos++;
-			if (lws_http2_parser(wsi, buf[n++]))
+			if (lws_http2_parser(wsi, buf[n++])) {
+				lwsl_debug("%s: http2_parser bailed\n", __func__);
 				goto bail;
+			}
 		}
 		break;
 #endif
 
+	case LWSS_HTTP_ISSUING_FILE:
+		return 0;
+
+	case LWSS_CLIENT_HTTP_ESTABLISHED:
+		break;
+
 	case LWSS_HTTP:
 		wsi->hdr_parsing_completed = 0;
 		/* fallthru */
-	case LWSS_HTTP_ISSUING_FILE:
-		wsi->state = LWSS_HTTP_HEADERS;
-		wsi->u.hdr.parser_state = WSI_TOKEN_NAME_PART;
-		wsi->u.hdr.lextable_pos = 0;
-		/* fallthru */
+
 	case LWSS_HTTP_HEADERS:
-		assert(wsi->u.hdr.ah);
+		if (!wsi->u.hdr.ah) {
+			lwsl_err("%s: LWSS_HTTP_HEADERS: NULL ah\n", __func__);
+			assert(0);
+		}
 		lwsl_parser("issuing %d bytes to parser\n", (int)len);
 
-		if (lws_handshake_client(wsi, &buf, len))
+		if (lws_handshake_client(wsi, &buf, (size_t)len))
 			goto bail;
 
 		last_char = buf;
-		if (lws_handshake_server(wsi, &buf, len))
+		if (lws_handshake_server(wsi, &buf, (size_t)len))
 			/* Handshake indicates this session is done. */
 			goto bail;
+
+		/* we might have transitioned to RAW */
+		if (wsi->mode == LWSCM_RAW)
+			 /* we gave the read buffer to RAW handler already */
+			goto read_ok;
 
 		/*
 		 * It's possible that we've exhausted our data already, or
@@ -121,7 +133,7 @@ lws_read(struct lws *wsi, unsigned char *buf, size_t len)
 		 * appropriately:
 		 */
 		len -= (buf - last_char);
-		lwsl_debug("%s: thinks we have used %d\n", __func__, len);
+		lwsl_debug("%s: thinks we have used %ld\n", __func__, (long)len);
 
 		if (!wsi->hdr_parsing_completed)
 			/* More header content on the way */
@@ -177,10 +189,10 @@ http_postbody:
 #endif
 				n = wsi->protocol->callback(wsi,
 					LWS_CALLBACK_HTTP_BODY, wsi->user_space,
-					buf, body_chunk_len);
+					buf, (size_t)body_chunk_len);
 				if (n)
 					goto bail;
-				n = body_chunk_len;
+				n = (size_t)body_chunk_len;
 #ifdef LWS_WITH_CGI
 			}
 #endif
@@ -193,6 +205,12 @@ http_postbody:
 			}
 			/* he sent all the content in time */
 postbody_completion:
+#ifdef LWS_WITH_CGI
+			/* if we're running a cgi, we can't let him off the hook just because he sent his POST data */
+			if (wsi->cgi)
+				lws_set_timeout(wsi, PENDING_TIMEOUT_CGI, wsi->context->timeout_secs);
+			else
+#endif
 			lws_set_timeout(wsi, NO_PENDING_TIMEOUT, 0);
 #ifdef LWS_WITH_CGI
 			if (!wsi->cgi)
@@ -205,19 +223,19 @@ postbody_completion:
 					goto bail;
 			}
 
-			goto http_complete;
+			break;
 		}
 		break;
 
 	case LWSS_ESTABLISHED:
 	case LWSS_AWAITING_CLOSE_ACK:
 	case LWSS_SHUTDOWN:
-		if (lws_handshake_client(wsi, &buf, len))
+		if (lws_handshake_client(wsi, &buf, (size_t)len))
 			goto bail;
 		switch (wsi->mode) {
 		case LWSCM_WS_SERVING:
 
-			if (lws_interpret_incoming_packet(wsi, &buf, len) < 0) {
+			if (lws_interpret_incoming_packet(wsi, &buf, (size_t)len) < 0) {
 				lwsl_info("interpret_incoming_packet has bailed\n");
 				goto bail;
 			}
@@ -225,32 +243,18 @@ postbody_completion:
 		}
 		break;
 	default:
-		lwsl_err("%s: Unhandled state\n", __func__);
+		lwsl_err("%s: Unhandled state %d\n", __func__, wsi->state);
 		break;
 	}
 
 read_ok:
 	/* Nothing more to do for now */
-	lwsl_info("%s: read_ok, used %d\n", __func__, buf - oldbuf);
+	lwsl_info("%s: read_ok, used %ld\n", __func__, (long)(buf - oldbuf));
 
 	return buf - oldbuf;
 
-http_complete:
-	lwsl_debug("%s: http_complete\n", __func__);
-
-#ifndef LWS_NO_SERVER
-	/* Did the client want to keep the HTTP connection going? */
-	if (lws_http_transaction_completed(wsi))
-		goto bail;
-#endif
-	/* we may have next header set already, but return to event loop first
-	 * so a heaily-pipelined http/1.1 connection cannot monopolize the
-	 * service thread with GET hugefile.bin GET hugefile.bin etc
-	 */
-	goto read_ok;
-
 bail:
-	lwsl_debug("closing connection at lws_read bail:\n");
+	//lwsl_notice("closing connection at lws_read bail:\n");
 	lws_close_free_wsi(wsi, LWS_CLOSE_STATUS_NOSTATUS);
 
 	return -1;

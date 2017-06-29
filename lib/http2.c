@@ -64,8 +64,7 @@ lws_create_server_child_wsi(struct lws_vhost *vhost, struct lws *parent_wsi,
 	if (parent_wsi->u.http2.child_count + 1 ==
 	    parent_wsi->u.http2.peer_settings.setting[
 			LWS_HTTP2_SETTINGS__MAX_CONCURRENT_STREAMS])
-		return NULL;
-
+		goto bail;
 	lws_http2_init(&wsi->u.http2.peer_settings);
 	lws_http2_init(&wsi->u.http2.my_settings);
 	wsi->u.http2.stream_id = sid;
@@ -83,12 +82,20 @@ lws_create_server_child_wsi(struct lws_vhost *vhost, struct lws *parent_wsi,
 	wsi->mode = parent_wsi->mode;
 
 	wsi->protocol = &vhost->protocols[0];
-	lws_ensure_user_space(wsi);
+	if (lws_ensure_user_space(wsi))
+		goto bail;
 
 	lwsl_info("%s: %p new child %p, sid %d, user_space=%p\n", __func__,
 		  parent_wsi, wsi, sid, wsi->user_space);
 
 	return wsi;
+
+bail:
+	vhost->protocols[0].callback(wsi, LWS_CALLBACK_WSI_DESTROY,
+			       NULL, NULL, 0);
+	lws_free(wsi);
+
+	return NULL;
 }
 
 int lws_remove_server_child_wsi(struct lws_context *context, struct lws *wsi)
@@ -162,14 +169,14 @@ int lws_http2_frame_write(struct lws *wsi, int type, int flags,
 	*p++ = sid >> 8;
 	*p++ = sid;
 
-	lwsl_info("%s: %p (eff %p). type %d, flags 0x%x, sid=%d, len=%d\n",
+	lwsl_info("%s: %p (eff %p). type %d, flags 0x%x, sid=%d, len=%d, tx_credit=%d\n",
 		  __func__, wsi, wsi_eff, type, flags, sid, len,
 		  wsi->u.http2.tx_credit);
 
 	if (type == LWS_HTTP2_FRAME_TYPE_DATA) {
 		if (wsi->u.http2.tx_credit < len)
 			lwsl_err("%s: %p: sending payload len %d"
-				 " but tx_credit only %d!\n", len,
+				 " but tx_credit only %d!\n", __func__, wsi, len,
 				 wsi->u.http2.tx_credit);
 		wsi->u.http2.tx_credit -= len;
 	}
@@ -242,8 +249,15 @@ lws_http2_parser(struct lws *wsi, unsigned char c)
 			case LWS_HTTP2_FRAME_TYPE_CONTINUATION:
 			case LWS_HTTP2_FRAME_TYPE_HEADERS:
 				lwsl_info(" %02X\n", c);
-				if (lws_hpack_interpret(wsi->u.http2.stream_wsi, c))
+				if (!wsi->u.http2.stream_wsi->u.hdr.ah)
+					if (lws_header_table_attach(wsi->u.http2.stream_wsi, 0)) {
+						lwsl_err("%s: Failed to get ah\n", __func__);
+						return 1;
+					}
+				if (lws_hpack_interpret(wsi->u.http2.stream_wsi, c)) {
+					lwsl_notice("%s: lws_hpack_interpret failed\n", __func__);
 					return 1;
+				}
 				break;
 			case LWS_HTTP2_FRAME_TYPE_GOAWAY:
 				if (wsi->u.http2.count >= 5 && wsi->u.http2.count <= 8) {
@@ -376,9 +390,11 @@ lws_http2_parser(struct lws *wsi, unsigned char c)
 				lwsl_info("LWS_HTTP2_FRAME_TYPE_HEADERS: stream_id = %d\n", wsi->u.http2.stream_id);
 				if (!wsi->u.http2.stream_id)
 					return 1;
-				if (!wsi->u.http2.stream_wsi)
+				if (!wsi->u.http2.stream_wsi) {
 					wsi->u.http2.stream_wsi =
 						lws_create_server_child_wsi(wsi->vhost, wsi, wsi->u.http2.stream_id);
+					wsi->u.http2.stream_wsi->http2_substream = 1;
+				}
 
 				/* END_STREAM means after servicing this, close the stream */
 				wsi->u.http2.END_STREAM = !!(wsi->u.http2.flags & LWS_HTTP2_FLAG_END_STREAM);
@@ -460,10 +476,10 @@ int lws_http2_do_pps_send(struct lws_context *context, struct lws *wsi)
 		if (wsi->state == LWSS_HTTP2_ESTABLISHED_PRE_SETTINGS) {
 			wsi->state = LWSS_HTTP2_ESTABLISHED;
 
-			wsi->u.http.fd = LWS_INVALID_FILE;
+			wsi->u.http.fop_fd = NULL;
 
 			if (lws_is_ssl(lws_http2_get_network_wsi(wsi))) {
-				lwsl_info("skipping nonexistant ssl upgrade headers\n");
+				lwsl_info("skipping nonexistent ssl upgrade headers\n");
 				break;
 			}
 

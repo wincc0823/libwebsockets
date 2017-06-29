@@ -6,7 +6,9 @@
 unsigned long long
 time_in_microseconds()
 {
+#ifndef DELTA_EPOCH_IN_MICROSECS
 #define DELTA_EPOCH_IN_MICROSECS 11644473600000000ULL
+#endif
 	FILETIME filetime;
 	ULARGE_INTEGER datetime;
 
@@ -31,7 +33,10 @@ time_in_microseconds()
 time_t time(time_t *t)
 {
 	time_t ret = time_in_microseconds() / 1000000;
-	*t = ret;
+
+	if(t != NULL)
+		*t = ret;
+
 	return ret;
 }
 #endif
@@ -45,7 +50,7 @@ wsi_from_fd(const struct lws_context *context, lws_sockfd_type fd)
 	int n = 0;
 
 	for (n = 0; n < context->fd_hashtable[h].length; n++)
-		if (context->fd_hashtable[h].wsi[n]->sock == fd)
+		if (context->fd_hashtable[h].wsi[n]->desc.sockfd == fd)
 			return context->fd_hashtable[h].wsi[n];
 
 	return NULL;
@@ -54,7 +59,7 @@ wsi_from_fd(const struct lws_context *context, lws_sockfd_type fd)
 int
 insert_wsi(struct lws_context *context, struct lws *wsi)
 {
-	int h = LWS_FD_HASH(wsi->sock);
+	int h = LWS_FD_HASH(wsi->desc.sockfd);
 
 	if (context->fd_hashtable[h].length == (getdtablesize() - 1)) {
 		lwsl_err("hash table overflow\n");
@@ -73,10 +78,10 @@ delete_from_fd(struct lws_context *context, lws_sockfd_type fd)
 	int n = 0;
 
 	for (n = 0; n < context->fd_hashtable[h].length; n++)
-		if (context->fd_hashtable[h].wsi[n]->sock == fd) {
+		if (context->fd_hashtable[h].wsi[n]->desc.sockfd == fd) {
 			while (n < context->fd_hashtable[h].length) {
 				context->fd_hashtable[h].wsi[n] =
-					    context->fd_hashtable[h].wsi[n + 1];
+						context->fd_hashtable[h].wsi[n + 1];
 				n++;
 			}
 			context->fd_hashtable[h].length--;
@@ -90,7 +95,7 @@ delete_from_fd(struct lws_context *context, lws_sockfd_type fd)
 }
 
 LWS_VISIBLE int lws_get_random(struct lws_context *context,
-							     void *buf, int len)
+								 void *buf, int len)
 {
 	int n;
 	char *p = (char *)buf;
@@ -103,6 +108,10 @@ LWS_VISIBLE int lws_get_random(struct lws_context *context,
 
 LWS_VISIBLE int lws_send_pipe_choked(struct lws *wsi)
 {
+	/* treat the fact we got a truncated send pending as if we're choked */
+	if (wsi->trunc_len)
+		return 1;
+
 	return (int)wsi->sock_send_blocking;
 }
 
@@ -119,13 +128,6 @@ LWS_VISIBLE int lws_poll_listen_fd(struct lws_pollfd *fd)
 	return select(fd->fd + 1, &readfds, NULL, NULL, &tv);
 }
 
-/**
- * lws_cancel_service() - Cancel servicing of pending websocket activity
- * @context:	Websocket context
- *
- *	This function let a call to lws_service() waiting for a timeout
- *	immediately return.
- */
 LWS_VISIBLE void
 lws_cancel_service(struct lws_context *context)
 {
@@ -150,10 +152,10 @@ LWS_VISIBLE void lwsl_emit_syslog(int level, const char *line)
 	lwsl_emit_stderr(level, line);
 }
 
-LWS_VISIBLE int
-lws_plat_service_tsi(struct lws_context *context, int timeout_ms, int tsi)
+LWS_VISIBLE LWS_EXTERN int
+_lws_plat_service_tsi(struct lws_context *context, int timeout_ms, int tsi)
 {
-	struct lws_context_per_thread *pt = &context->pt[tsi];
+	struct lws_context_per_thread *pt;
 	WSANETWORKEVENTS networkevents;
 	struct lws_pollfd *pfd;
 	struct lws *wsi;
@@ -165,6 +167,8 @@ lws_plat_service_tsi(struct lws_context *context, int timeout_ms, int tsi)
 	if (context == NULL)
 		return 1;
 
+	pt = &context->pt[tsi];
+
 	if (!context->service_tid_detected) {
 		struct lws _lws;
 
@@ -173,9 +177,28 @@ lws_plat_service_tsi(struct lws_context *context, int timeout_ms, int tsi)
 
 		context->service_tid_detected = context->vhost_list->
 			protocols[0].callback(&_lws, LWS_CALLBACK_GET_THREAD_ID,
-					      NULL, NULL, 0);
+						  NULL, NULL, 0);
 	}
 	context->service_tid = context->service_tid_detected;
+
+	if (timeout_ms < 0)
+	{
+			if (lws_service_flag_pending(context, tsi)) {
+			/* any socket with events to service? */
+			for (n = 0; n < (int)pt->fds_count; n++) {
+				if (!pt->fds[n].revents)
+					continue;
+
+				m = lws_service_fd_tsi(context, &pt->fds[n], tsi);
+				if (m < 0)
+					return -1;
+				/* if something closed, retry this slot */
+				if (m)
+					n--;
+			}
+		}
+		return 0;
+	}
 
 	for (i = 0; i < pt->fds_count; ++i) {
 		pfd = &pt->fds[i];
@@ -197,72 +220,73 @@ lws_plat_service_tsi(struct lws_context *context, int timeout_ms, int tsi)
 			i--;
 	}
 
-	/* if we know something needs service already, don't wait in poll */
-	timeout_ms = lws_service_adjust_timeout(context, timeout_ms, tsi);
+	/*
+	 * is there anybody with pending stuff that needs service forcing?
+	 */
+	if (!lws_service_adjust_timeout(context, 1, tsi)) {
+		/* -1 timeout means just do forced service */
+		_lws_plat_service_tsi(context, -1, pt->tid);
+		/* still somebody left who wants forced service? */
+		if (!lws_service_adjust_timeout(context, 1, pt->tid))
+			/* yes... come back again quickly */
+			timeout_ms = 0;
+	}
 
-	ev = WSAWaitForMultipleEvents(pt->fds_count + 1, pt->events,
-				      FALSE, timeout_ms, FALSE);
+	ev = WSAWaitForMultipleEvents( 1,  pt->events , FALSE, timeout_ms, FALSE);
+	if (ev == WSA_WAIT_EVENT_0) {
+		unsigned int eIdx;
+
+		WSAResetEvent(pt->events[0]);
+
+		for (eIdx = 0; eIdx < pt->fds_count; ++eIdx) {
+			if (WSAEnumNetworkEvents(pt->fds[eIdx].fd, 0, &networkevents) == SOCKET_ERROR) {
+				lwsl_err("WSAEnumNetworkEvents() failed with error %d\n", LWS_ERRNO);
+				return -1;
+			}
+
+			pfd = &pt->fds[eIdx];
+			pfd->revents = (short)networkevents.lNetworkEvents;
+
+			if ((networkevents.lNetworkEvents & FD_CONNECT) &&
+				 networkevents.iErrorCode[FD_CONNECT_BIT] &&
+				 networkevents.iErrorCode[FD_CONNECT_BIT] != LWS_EALREADY &&
+				 networkevents.iErrorCode[FD_CONNECT_BIT] != LWS_EINPROGRESS &&
+				 networkevents.iErrorCode[FD_CONNECT_BIT] != LWS_EWOULDBLOCK &&
+				 networkevents.iErrorCode[FD_CONNECT_BIT] != WSAEINVAL) {
+				lwsl_debug("Unable to connect errno=%d\n",
+					   networkevents.iErrorCode[FD_CONNECT_BIT]);
+				pfd->revents = LWS_POLLHUP;
+			} else
+				pfd->revents = (short)networkevents.lNetworkEvents;
+
+			if (pfd->revents & LWS_POLLOUT) {
+				wsi = wsi_from_fd(context, pfd->fd);
+				if (wsi)
+					wsi->sock_send_blocking = 0;
+			}
+			 /* if something closed, retry this slot */
+			if (pfd->revents & LWS_POLLHUP)
+					--eIdx;
+
+			if( pfd->revents != 0 ) {
+				lws_service_fd_tsi(context, pfd, tsi);
+
+			}
+		}
+	}
+
 	context->service_tid = 0;
 
 	if (ev == WSA_WAIT_TIMEOUT) {
 		lws_service_fd(context, NULL);
-		return 0;
 	}
-
-	if (ev == WSA_WAIT_EVENT_0) {
-		WSAResetEvent(pt->events[0]);
-		return 0;
-	}
-
-	if (ev < WSA_WAIT_EVENT_0 || ev > WSA_WAIT_EVENT_0 + pt->fds_count)
-		return -1;
-
-	pfd = &pt->fds[ev - WSA_WAIT_EVENT_0 - 1];
-
-	/* eh... is one event at a time the best windows can do? */
-
-	if (WSAEnumNetworkEvents(pfd->fd, pt->events[ev - WSA_WAIT_EVENT_0],
-				 &networkevents) == SOCKET_ERROR) {
-		lwsl_err("WSAEnumNetworkEvents() failed with error %d\n",
-								     LWS_ERRNO);
-		return -1;
-	}
-
-	pfd->revents = (short)networkevents.lNetworkEvents;
-
-	if (pfd->revents & LWS_POLLOUT) {
-		wsi = wsi_from_fd(context, pfd->fd);
-		if (wsi)
-			wsi->sock_send_blocking = 0;
-	}
-
-	/* if someone faked their LWS_POLLIN, then go through all active fds */
-
-	if (lws_service_flag_pending(context, tsi)) {
-		/* any socket with events to service? */
-		for (n = 0; n < (int)pt->fds_count; n++) {
-			if (!pt->fds[n].revents)
-				continue;
-
-			m = lws_service_fd_tsi(context, &pt->fds[n], tsi);
-			if (m < 0)
-				return -1;
-			/* if something closed, retry this slot */
-			if (m)
-				n--;
-		}
-		return 0;
-	}
-
-	/* otherwise just do the one... must be a way to improve that... */
-
-	return lws_service_fd_tsi(context, pfd, tsi);
+	return 0;;
 }
 
 LWS_VISIBLE int
 lws_plat_service(struct lws_context *context, int timeout_ms)
 {
-	return lws_plat_service_tsi(context, timeout_ms, 0);
+	return _lws_plat_service_tsi(context, timeout_ms, 0);
 }
 
 LWS_VISIBLE int
@@ -282,7 +306,7 @@ lws_plat_set_socket_options(struct lws_vhost *vhost, lws_sockfd_type fd)
 		/* enable keepalive on this socket */
 		optval = 1;
 		if (setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE,
-					     (const char *)&optval, optlen) < 0)
+						 (const char *)&optval, optlen) < 0)
 			return 1;
 
 		alive.onoff = TRUE;
@@ -290,7 +314,7 @@ lws_plat_set_socket_options(struct lws_vhost *vhost, lws_sockfd_type fd)
 		alive.keepaliveinterval = vhost->ka_interval;
 
 		if (WSAIoctl(fd, SIO_KEEPALIVE_VALS, &alive, sizeof(alive),
-					      NULL, 0, &dwBytesRet, NULL, NULL))
+						  NULL, 0, &dwBytesRet, NULL, NULL))
 			return 1;
 	}
 
@@ -374,6 +398,16 @@ LWS_VISIBLE LWS_EXTERN int
 lws_interface_to_sa(int ipv6,
 		const char *ifname, struct sockaddr_in *addr, size_t addrlen)
 {
+#ifdef LWS_USE_IPV6
+	struct sockaddr_in6 *addr6 = (struct sockaddr_in6 *)addr;
+
+	if (ipv6) {
+		if (lws_plat_inet_pton(AF_INET6, ifname, &addr6->sin6_addr) == 1) {
+			return 0;
+		}
+	}
+#endif
+
 	long long address = inet_addr(ifname);
 
 	if (address == INADDR_NONE) {
@@ -396,9 +430,9 @@ lws_plat_insert_socket_into_fds(struct lws_context *context, struct lws *wsi)
 	struct lws_context_per_thread *pt = &context->pt[(int)wsi->tsi];
 
 	pt->fds[pt->fds_count++].revents = 0;
-	pt->events[pt->fds_count] = WSACreateEvent();
-	WSAEventSelect(wsi->sock, pt->events[pt->fds_count],
-		       LWS_POLLIN | LWS_POLLHUP);
+	pt->events[pt->fds_count] = pt->events[0];
+	WSAEventSelect(wsi->desc.sockfd, pt->events[0],
+			   LWS_POLLIN | LWS_POLLHUP | FD_CONNECT);
 }
 
 LWS_VISIBLE void
@@ -407,7 +441,6 @@ lws_plat_delete_socket_from_fds(struct lws_context *context,
 {
 	struct lws_context_per_thread *pt = &context->pt[(int)wsi->tsi];
 
-	WSACloseEvent(pt->events[m + 1]);
 	pt->events[m + 1] = pt->events[pt->fds_count--];
 }
 
@@ -417,11 +450,28 @@ lws_plat_service_periodic(struct lws_context *context)
 }
 
 LWS_VISIBLE int
+lws_plat_check_connection_error(struct lws *wsi)
+{
+	int optVal;
+	int optLen = sizeof(int);
+
+	if (getsockopt(wsi->desc.sockfd, SOL_SOCKET, SO_ERROR,
+			   (char*)&optVal, &optLen) != SOCKET_ERROR && optVal &&
+		optVal != LWS_EALREADY && optVal != LWS_EINPROGRESS &&
+		optVal != LWS_EWOULDBLOCK && optVal != WSAEINVAL) {
+		   lwsl_debug("Connect failed SO_ERROR=%d\n", optVal);
+		   return 1;
+	}
+
+	return 0;
+}
+
+LWS_VISIBLE int
 lws_plat_change_pollfd(struct lws_context *context,
-		      struct lws *wsi, struct lws_pollfd *pfd)
+			  struct lws *wsi, struct lws_pollfd *pfd)
 {
 	struct lws_context_per_thread *pt = &context->pt[(int)wsi->tsi];
-	long networkevents = LWS_POLLHUP;
+	long networkevents = LWS_POLLHUP | FD_CONNECT;
 
 	if ((pfd->events & LWS_POLLIN))
 		networkevents |= LWS_POLLIN;
@@ -429,9 +479,9 @@ lws_plat_change_pollfd(struct lws_context *context,
 	if ((pfd->events & LWS_POLLOUT))
 		networkevents |= LWS_POLLOUT;
 
-	if (WSAEventSelect(wsi->sock,
-			pt->events[wsi->position_in_fds_table + 1],
-					       networkevents) != SOCKET_ERROR)
+	if (WSAEventSelect(wsi->desc.sockfd,
+			pt->events[0],
+						   networkevents) != SOCKET_ERROR)
 		return 0;
 
 	lwsl_err("WSAEventSelect() failed with error %d\n", LWS_ERRNO);
@@ -446,7 +496,7 @@ lws_plat_inet_ntop(int af, const void *src, char *dst, int cnt)
 	DWORD bufferlen = cnt;
 	BOOL ok = FALSE;
 
-	buffer = lws_malloc(bufferlen);
+	buffer = lws_malloc(bufferlen * 2);
 	if (!buffer) {
 		lwsl_err("Out of memory\n");
 		return NULL;
@@ -485,84 +535,161 @@ lws_plat_inet_ntop(int af, const void *src, char *dst, int cnt)
 	return ok ? dst : NULL;
 }
 
-static lws_filefd_type
-_lws_plat_file_open(struct lws *wsi, const char *filename,
-		    unsigned long *filelen, int flags)
+LWS_VISIBLE int
+lws_plat_inet_pton(int af, const char *src, void *dst)
+{
+	WCHAR *buffer;
+	DWORD bufferlen = strlen(src) + 1;
+	BOOL ok = FALSE;
+
+	buffer = lws_malloc(bufferlen * 2);
+	if (!buffer) {
+		lwsl_err("Out of memory\n");
+		return -1;
+	}
+
+	if (MultiByteToWideChar(CP_ACP, 0, src, bufferlen, buffer, bufferlen) <= 0) {
+		lwsl_err("Failed to convert multi byte to wide char\n");
+		lws_free(buffer);
+		return -1;
+	}
+
+	if (af == AF_INET) {
+		struct sockaddr_in dstaddr;
+		int dstaddrlen = sizeof(dstaddr);
+		bzero(&dstaddr, sizeof(dstaddr));
+		dstaddr.sin_family = AF_INET;
+
+		if (!WSAStringToAddressW(buffer, af, 0, (struct sockaddr *) &dstaddr, &dstaddrlen)) {
+			ok = TRUE;
+			memcpy(dst, &dstaddr.sin_addr, sizeof(dstaddr.sin_addr));
+		}
+#ifdef LWS_USE_IPV6
+	} else if (af == AF_INET6) {
+		struct sockaddr_in6 dstaddr;
+		int dstaddrlen = sizeof(dstaddr);
+		bzero(&dstaddr, sizeof(dstaddr));
+		dstaddr.sin6_family = AF_INET6;
+
+		if (!WSAStringToAddressW(buffer, af, 0, (struct sockaddr *) &dstaddr, &dstaddrlen)) {
+			ok = TRUE;
+			memcpy(dst, &dstaddr.sin6_addr, sizeof(dstaddr.sin6_addr));
+		}
+#endif
+	} else
+		lwsl_err("Unsupported type\n");
+
+	if (!ok) {
+		int rv = WSAGetLastError();
+		lwsl_err("WSAAddressToString() : %d\n", rv);
+	}
+
+	lws_free(buffer);
+	return ok ? 1 : -1;
+}
+
+LWS_VISIBLE lws_fop_fd_t
+_lws_plat_file_open(const struct lws_plat_file_ops *fops, const char *filename,
+		    const char *vpath, lws_fop_flags_t *flags)
 {
 	HANDLE ret;
 	WCHAR buf[MAX_PATH];
+	lws_fop_fd_t fop_fd;
+	LARGE_INTEGER llFileSize = {0};
 
-	(void)wsi;
 	MultiByteToWideChar(CP_UTF8, 0, filename, -1, buf, ARRAY_SIZE(buf));
-	if ((flags & 7) == _O_RDONLY) {
+	if (((*flags) & 7) == _O_RDONLY) {
 		ret = CreateFileW(buf, GENERIC_READ, FILE_SHARE_READ,
 			  NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
 	} else {
-		lwsl_err("%s: open for write not implemented\n", __func__);
-		*filelen = 0;
-		return LWS_INVALID_FILE;
+		ret = CreateFileW(buf, GENERIC_WRITE, 0, NULL,
+			  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 	}
 
-	if (ret != LWS_INVALID_FILE)
-		*filelen = GetFileSize(ret, NULL);
+	if (ret == LWS_INVALID_FILE)
+		goto bail;
 
-	return ret;
+	fop_fd = malloc(sizeof(*fop_fd));
+	if (!fop_fd)
+		goto bail;
+
+	fop_fd->fops = fops;
+	fop_fd->fd = ret;
+	fop_fd->filesystem_priv = NULL; /* we don't use it */
+	fop_fd->flags = *flags;
+	fop_fd->len = GetFileSize(ret, NULL);
+	if(GetFileSizeEx(ret, &llFileSize))
+		fop_fd->len = llFileSize.QuadPart;
+
+	fop_fd->pos = 0;
+
+	return fop_fd;
+
+bail:
+	return NULL;
 }
 
-static int
-_lws_plat_file_close(struct lws *wsi, lws_filefd_type fd)
+LWS_VISIBLE int
+_lws_plat_file_close(lws_fop_fd_t *fop_fd)
 {
-	(void)wsi;
+	HANDLE fd = (*fop_fd)->fd;
+
+	free(*fop_fd);
+	*fop_fd = NULL;
 
 	CloseHandle((HANDLE)fd);
 
 	return 0;
 }
 
-static unsigned long
-_lws_plat_file_seek_cur(struct lws *wsi, lws_filefd_type fd, long offset)
+LWS_VISIBLE lws_fileofs_t
+_lws_plat_file_seek_cur(lws_fop_fd_t fop_fd, lws_fileofs_t offset)
 {
-	(void)wsi;
+	LARGE_INTEGER l;
 
-	return SetFilePointer((HANDLE)fd, offset, NULL, FILE_CURRENT);
+	l.QuadPart = offset;
+	return SetFilePointerEx((HANDLE)fop_fd->fd, l, NULL, FILE_CURRENT);
 }
 
-static int
-_lws_plat_file_read(struct lws *wsi, lws_filefd_type fd, unsigned long *amount,
-		    unsigned char* buf, unsigned long len)
+LWS_VISIBLE int
+_lws_plat_file_read(lws_fop_fd_t fop_fd, lws_filepos_t *amount,
+		    uint8_t *buf, lws_filepos_t len)
 {
 	DWORD _amount;
 
-	(void *)wsi;
-	if (!ReadFile((HANDLE)fd, buf, (DWORD)len, &_amount, NULL)) {
+	if (!ReadFile((HANDLE)fop_fd->fd, buf, (DWORD)len, &_amount, NULL)) {
 		*amount = 0;
 
 		return 1;
 	}
 
+	fop_fd->pos += _amount;
 	*amount = (unsigned long)_amount;
 
 	return 0;
 }
 
-static int
-_lws_plat_file_write(struct lws *wsi, lws_filefd_type fd, unsigned long *amount,
-		     unsigned char* buf, unsigned long len)
+LWS_VISIBLE int
+_lws_plat_file_write(lws_fop_fd_t fop_fd, lws_filepos_t *amount,
+			 uint8_t* buf, lws_filepos_t len)
 {
-	(void)wsi;
-	(void)fd;
-	(void)amount;
-	(void)buf;
-	(void)len;
+	DWORD _amount;
 
-	lwsl_err("%s: not implemented yet on this platform\n", __func__);
+	if (!WriteFile((HANDLE)fop_fd->fd, buf, (DWORD)len, &_amount, NULL)) {
+		*amount = 0;
 
-	return -1;
+		return 1;
+	}
+
+	fop_fd->pos += _amount;
+	*amount = (unsigned long)_amount;
+
+	return 0;
 }
 
 LWS_VISIBLE int
 lws_plat_init(struct lws_context *context,
-	      struct lws_context_creation_info *info)
+		  struct lws_context_creation_info *info)
 {
 	struct lws_context_per_thread *pt = &context->pt[0];
 	int i, n = context->count_threads;
@@ -592,11 +719,24 @@ lws_plat_init(struct lws_context *context,
 
 	context->fd_random = 0;
 
-	context->fops.open	= _lws_plat_file_open;
-	context->fops.close	= _lws_plat_file_close;
-	context->fops.seek_cur	= _lws_plat_file_seek_cur;
-	context->fops.read	= _lws_plat_file_read;
-	context->fops.write	= _lws_plat_file_write;
+#ifdef LWS_WITH_PLUGINS
+	if (info->plugin_dirs)
+		lws_plat_plugins_init(context, info->plugin_dirs);
+#endif
 
 	return 0;
 }
+
+
+int kill(int pid, int sig)
+{
+	lwsl_err("Sorry Windows doesn't support kill().");
+	exit(0);
+}
+
+int fork(void)
+{
+	lwsl_err("Sorry Windows doesn't support fork().");
+	exit(0);
+}
+
